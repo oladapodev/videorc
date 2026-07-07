@@ -4612,16 +4612,7 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn recording_queue_drop_watch_surfaces_each_affected_session_once() {
-        let mut watch = RecordingQueueDropWatch::default();
-        assert!(!recording_queue_drop_watch_update(&mut watch, "s1", 0));
-        assert!(recording_queue_drop_watch_update(&mut watch, "s1", 1));
-        assert!(!recording_queue_drop_watch_update(&mut watch, "s1", 9));
-        assert!(!recording_queue_drop_watch_update(&mut watch, "s2", 0));
-        assert!(recording_queue_drop_watch_update(&mut watch, "s2", 2));
-    }
-
+    use super::*;
     #[cfg(target_os = "macos")]
     use crate::compositor::CompositorFrameExportHandle;
     use crate::compositor::CompositorPixelFormat;

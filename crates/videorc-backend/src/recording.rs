@@ -19,11 +19,8 @@ use uuid::Uuid;
 use crate::audio::{
     AudioCaptureStats, AudioProcessingSettings, NATIVE_AUDIO_CHANNELS, NATIVE_AUDIO_SAMPLE_RATE,
     NativeAudioCaptureSession, NativeAudioSource, attach_fifo_writer, audio_capture_coverage,
-    create_native_audio_fifo, native_audio_fifo_path, parse_coreaudio_microphone_id,
-    parse_windows_dshow_microphone_id, start_native_audio_source,
-};
-use crate::camera_capture::{
-    native_camera_name_for_id, parse_native_camera_id, parse_windows_dshow_camera_id,
+    create_native_audio_fifo, native_audio_fifo_path, parse_native_microphone_id,
+    start_native_audio_source,
 };
 use crate::capture_input::{
     MicrophoneInput, VideoInput, WindowsScreenCaptureBackend, append_avfoundation_video_input,
@@ -4809,7 +4806,16 @@ struct PreparedNativeAudioSource {
 }
 
 async fn resolve_capture_inputs(ffmpeg_path: &str, params: &StartSessionParams) -> CaptureInputs {
-    let microphone = resolve_microphone_input(params.sources.microphone_id.as_deref());
+    let microphone = params.sources.microphone_id.as_deref().and_then(|id| {
+        parse_native_microphone_id(id)
+            .map(|device_id| MicrophoneInput::CoreAudio {
+                device_id,
+                fifo_path: None,
+            })
+            .or_else(|| {
+                parse_avfoundation_id(id).map(|index| MicrophoneInput::AvFoundation { index })
+            })
+    });
 
     // Camera-only makes the camera the primary input. No screen is enumerated or
     // captured, so macOS Screen Recording permission is never requested.
