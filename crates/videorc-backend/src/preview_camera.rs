@@ -8,6 +8,7 @@ use chrono::Utc;
 use image::ImageEncoder;
 use image::codecs::png::PngEncoder;
 use image::imageops::FilterType;
+use rayon::prelude::*;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
@@ -16,6 +17,7 @@ use crate::camera_capture::{
     CameraFormatSummary, camera_capability_matrix_for_id, parse_native_camera_id,
     parse_windows_dshow_camera_id,
 };
+use crate::color::{ycbcr_bt709_full_to_bgr, ycbcr_bt709_video_to_bgr};
 use crate::diagnostics::{
     PreviewCameraCaptureTimingStats, apply_preview_camera_capability_stats,
     apply_preview_camera_capture_timing_stats, apply_preview_camera_source_stats,
@@ -1544,280 +1546,79 @@ fn run_native_camera_preview(
     }
 }
 
-#[cfg(target_os = "windows")]
-mod windows {
-    use std::io::Read;
-    use std::process::{Child, Command, Stdio};
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    use super::*;
-    use crate::process_job::spawn_owned_std;
-
-    pub fn run_native_camera_preview(
-        config: NativeCameraPreviewConfig,
-        shared: Arc<StdMutex<PreviewCameraShared>>,
-        stop_rx: std_mpsc::Receiver<()>,
-        startup_tx: std_mpsc::Sender<NativeCameraStartup>,
-    ) {
-        let (width, height) = windows_camera_preview_output_dimensions(&config);
-        let fps = config.video.fps.clamp(1, 120);
-        let Some(frame_len) = bgra_frame_len(width, height) else {
-            let _ = startup_tx.send(NativeCameraStartup::Failed(
-                "Windows camera preview dimensions are too large.".to_string(),
-            ));
-            return;
-        };
-
-        // One stop signal shared across attempts; a per-attempt killer reacts
-        // to it (the read loop unblocks when the ffmpeg child is killed).
-        let stop_flag = Arc::new(AtomicBool::new(false));
-        {
-            let stop_flag = Arc::clone(&stop_flag);
-            thread::spawn(move || {
-                let _ = stop_rx.recv();
-                stop_flag.store(true, Ordering::Release);
-            });
-        }
-
-        // Attempt with the requested framerate first; if the device never
-        // produces a frame (dshow can reject an exact `-framerate` a webcam
-        // does not offer), retry once letting dshow negotiate its default
-        // format. This is the second half of the zero-frames fix (the first is
-        // using the dshow friendly name rather than the MF symbolic link).
-        let attempts = [Some(fps), None];
-        for (attempt_index, request_fps) in attempts.into_iter().enumerate() {
-            if stop_flag.load(Ordering::Acquire) {
+/// NV12 (4:2:0 bi-planar Y'CbCr) -> BGRA, parallelized across output rows.
+#[allow(clippy::too_many_arguments)]
+fn nv12_to_bgra(
+    y: &[u8],
+    y_stride: usize,
+    cbcr: &[u8],
+    cbcr_stride: usize,
+    width: usize,
+    height: usize,
+    full_range: bool,
+    out: &mut [u8],
+) {
+    let row_bytes = width * 4;
+    out.par_chunks_mut(row_bytes)
+        .enumerate()
+        .for_each(|(row, out_row)| {
+            if row >= height {
                 return;
             }
-            let last_attempt = attempt_index + 1 == attempts.len();
-            match run_windows_camera_preview_attempt(
-                &config,
-                &shared,
-                &startup_tx,
-                &stop_flag,
-                width,
-                height,
-                fps,
-                frame_len,
-                request_fps,
-                last_attempt,
-            ) {
-                CameraPreviewAttempt::ProducedFrames | CameraPreviewAttempt::Stopped => return,
-                CameraPreviewAttempt::FailedBeforeFirstFrame => {
-                    // Retry the next attempt (or, if this was the last, the
-                    // Failed status was already sent by the attempt).
-                }
+            let y_row = &y[row * y_stride..];
+            let cbcr_row = &cbcr[(row / 2) * cbcr_stride..];
+            for (x, pixel) in out_row.chunks_exact_mut(4).enumerate() {
+                let chroma = (x / 2) * 2;
+                let (b, g, r) = if full_range {
+                    ycbcr_bt709_full_to_bgr(y_row[x], cbcr_row[chroma], cbcr_row[chroma + 1])
+                } else {
+                    ycbcr_bt709_video_to_bgr(y_row[x], cbcr_row[chroma], cbcr_row[chroma + 1])
+                };
+                pixel[0] = b;
+                pixel[1] = g;
+                pixel[2] = r;
+                pixel[3] = 255;
             }
-        }
-    }
+        });
+}
 
-    enum CameraPreviewAttempt {
-        ProducedFrames,
-        Stopped,
-        FailedBeforeFirstFrame,
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn run_windows_camera_preview_attempt(
-        config: &NativeCameraPreviewConfig,
-        shared: &Arc<StdMutex<PreviewCameraShared>>,
-        startup_tx: &std_mpsc::Sender<NativeCameraStartup>,
-        stop_flag: &Arc<AtomicBool>,
-        width: u32,
-        height: u32,
-        fps: u32,
-        frame_len: usize,
-        request_fps: Option<u32>,
-        last_attempt: bool,
-    ) -> CameraPreviewAttempt {
-        let args = windows_camera_preview_ffmpeg_args_opts(config, width, height, fps, request_fps);
-        let mut command = Command::new(&config.ffmpeg_path);
-        command
-            .args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut child = match spawn_owned_std(&mut command) {
-            Ok(child) => child,
-            Err(error) => {
-                if last_attempt {
-                    let _ = startup_tx.send(NativeCameraStartup::Failed(format!(
-                        "Could not start {} for Windows camera preview: {error}",
-                        config.ffmpeg_path
-                    )));
-                }
-                return CameraPreviewAttempt::FailedBeforeFirstFrame;
+/// Packed 4:2:2 Y'CbCr -> BGRA, parallelized by row. `uyvy` selects the byte
+/// order: UYVY (`2vuy`, Cb Y0 Cr Y1) when true, YUY2 (`yuvs`, Y0 Cb Y1 Cr) when false.
+fn yuv422_to_bgra(
+    plane: &[u8],
+    stride: usize,
+    width: usize,
+    height: usize,
+    uyvy: bool,
+    out: &mut [u8],
+) {
+    let row_bytes = width * 4;
+    out.par_chunks_mut(row_bytes)
+        .enumerate()
+        .for_each(|(row, out_row)| {
+            if row >= height {
+                return;
             }
-        };
-        let Some(mut stdout) = child.stdout.take() else {
-            let _ = child.kill();
-            if last_attempt {
-                let _ = startup_tx.send(NativeCameraStartup::Failed(
-                    "Windows camera preview did not expose FFmpeg stdout.".to_string(),
-                ));
+            let src = &plane[row * stride..];
+            for (pair, out8) in out_row.chunks_exact_mut(8).enumerate() {
+                let i = pair * 4;
+                let (cb, y0, cr, y1) = if uyvy {
+                    (src[i], src[i + 1], src[i + 2], src[i + 3])
+                } else {
+                    (src[i + 1], src[i], src[i + 3], src[i + 2])
+                };
+                let (b0, g0, r0) = ycbcr_bt709_video_to_bgr(y0, cb, cr);
+                let (b1, g1, r1) = ycbcr_bt709_video_to_bgr(y1, cb, cr);
+                out8[0] = b0;
+                out8[1] = g0;
+                out8[2] = r0;
+                out8[3] = 255;
+                out8[4] = b1;
+                out8[5] = g1;
+                out8[6] = r1;
+                out8[7] = 255;
             }
-            return CameraPreviewAttempt::FailedBeforeFirstFrame;
-        };
-        let stderr = collect_stderr(child.stderr.take());
-        let child = Arc::new(StdMutex::new(child));
-        let done = Arc::new(AtomicBool::new(false));
-        let killer =
-            spawn_stop_flag_killer(Arc::clone(&child), Arc::clone(&done), Arc::clone(stop_flag));
-
-        let mut startup_sent = false;
-        let mut buffer = shared
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .frame_store
-            .checkout_overwrite_buffer(frame_len);
-        let mut outcome = CameraPreviewAttempt::FailedBeforeFirstFrame;
-        loop {
-            match stdout.read_exact(&mut buffer) {
-                Ok(()) => {
-                    buffer = publish_bgra_frame(shared, width, height, buffer);
-                    if !startup_sent {
-                        let _ = startup_tx.send(NativeCameraStartup::Live {
-                            requested_width: width,
-                            requested_height: height,
-                            selected_format_width: width,
-                            selected_format_height: height,
-                            selected_format_min_fps: fps as f64,
-                            selected_format_max_fps: fps as f64,
-                            width,
-                            height,
-                            selected_fps: fps as f64,
-                            message: Some(
-                                "Windows FFmpeg camera preview is using dshow.".to_string(),
-                            ),
-                        });
-                        startup_sent = true;
-                        outcome = CameraPreviewAttempt::ProducedFrames;
-                    }
-                }
-                Err(error) => {
-                    if startup_sent {
-                        // Ran and then ended (stop, unplug, or EOF); the caller
-                        // must not retry a preview that already went live.
-                        outcome = CameraPreviewAttempt::ProducedFrames;
-                    } else if stop_flag.load(Ordering::Acquire) {
-                        outcome = CameraPreviewAttempt::Stopped;
-                    } else if last_attempt {
-                        let _ = startup_tx.send(NativeCameraStartup::Failed(format!(
-                            "Windows FFmpeg camera preview ended before the first frame: {error}{}",
-                            stderr_suffix(&stderr)
-                        )));
-                    }
-                    break;
-                }
-            }
-        }
-
-        done.store(true, Ordering::Release);
-        let _ = child
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .wait();
-        let _ = killer.join();
-        outcome
-    }
-
-    fn bgra_frame_len(width: u32, height: u32) -> Option<usize> {
-        (width as usize)
-            .checked_mul(height as usize)?
-            .checked_mul(4)
-    }
-
-    fn collect_stderr(stderr: Option<std::process::ChildStderr>) -> Arc<StdMutex<Vec<u8>>> {
-        let bytes = Arc::new(StdMutex::new(Vec::new()));
-        if let Some(mut stderr) = stderr {
-            let target = Arc::clone(&bytes);
-            thread::spawn(move || {
-                let mut buffer = Vec::new();
-                let _ = stderr.read_to_end(&mut buffer);
-                *target
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = buffer;
-            });
-        }
-        bytes
-    }
-
-    fn spawn_stop_flag_killer(
-        child: Arc<StdMutex<Child>>,
-        done: Arc<AtomicBool>,
-        stop_flag: Arc<AtomicBool>,
-    ) -> thread::JoinHandle<()> {
-        thread::spawn(move || {
-            while !done.load(Ordering::Acquire) {
-                if stop_flag.load(Ordering::Acquire) {
-                    let _ = child
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .kill();
-                    return;
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
-        })
-    }
-
-    fn publish_bgra_frame(
-        shared: &Arc<StdMutex<PreviewCameraShared>>,
-        width: u32,
-        height: u32,
-        bytes: Vec<u8>,
-    ) -> Vec<u8> {
-        let callback_started_at = Instant::now();
-        let publish_started_at = Instant::now();
-        let frame_len = bytes.len();
-        let frame_bytes = frame_len as u64;
-        let mut guard = shared
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard
-            .capture_timings
-            .record_callback_at(callback_started_at);
-        let now = Instant::now();
-        guard.frames_captured = guard.frames_captured.saturating_add(1);
-        guard.frames_in_window = guard.frames_in_window.saturating_add(1);
-        let window_started = *guard.window_started_at.get_or_insert(now);
-        let elapsed = window_started.elapsed();
-        if elapsed >= Duration::from_millis(500) {
-            guard.source_fps =
-                Some(guard.frames_in_window as f64 / elapsed.as_secs_f64().max(0.001));
-            guard.frames_in_window = 0;
-            guard.window_started_at = Some(now);
-        }
-        let sequence = guard.frames_captured;
-        guard.frame_store.publish_with_metadata(
-            sequence,
-            width,
-            height,
-            PreviewCameraPixelFormat::Bgra8,
-            (),
-            now,
-            bytes,
-        );
-        let next_buffer = guard.frame_store.checkout_overwrite_buffer(frame_len);
-        let publish_ms = publish_started_at.elapsed().as_secs_f64() * 1000.0;
-        guard
-            .capture_timings
-            .record_valid_frame(0.0, 0.0, publish_ms, frame_bytes);
-        next_buffer
-    }
-
-    fn stderr_suffix(stderr: &Arc<StdMutex<Vec<u8>>>) -> String {
-        let bytes = stderr
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let message = String::from_utf8_lossy(&bytes).trim().to_string();
-        if message.is_empty() {
-            String::new()
-        } else {
-            format!(": {message}")
-        }
-    }
+        });
 }
 
 #[cfg(target_os = "macos")]
@@ -1847,13 +1648,11 @@ mod macos {
         kCVPixelFormatType_422YpCbCr8_yuvs,
     };
     use objc2_foundation::{NSDictionary, NSNumber, NSObject, NSObjectProtocol, NSString};
-    use rayon::prelude::*;
 
     use super::*;
     use crate::camera_capture::{
         CameraFormatSummary, NativeCameraPermission, choose_camera_format,
     };
-    use crate::color::{ycbcr_bt709_full_to_bgr, ycbcr_bt709_video_to_bgr};
 
     struct CameraDelegateIvars {
         shared: Arc<StdMutex<PreviewCameraShared>>,
@@ -2520,81 +2319,6 @@ mod macos {
             out,
         );
         true
-    }
-
-    /// NV12 (4:2:0 bi-planar Y'CbCr) -> BGRA, parallelized across output rows.
-    #[allow(clippy::too_many_arguments)]
-    fn nv12_to_bgra(
-        y: &[u8],
-        y_stride: usize,
-        cbcr: &[u8],
-        cbcr_stride: usize,
-        width: usize,
-        height: usize,
-        full_range: bool,
-        out: &mut [u8],
-    ) {
-        let row_bytes = width * 4;
-        out.par_chunks_mut(row_bytes)
-            .enumerate()
-            .for_each(|(row, out_row)| {
-                if row >= height {
-                    return;
-                }
-                let y_row = &y[row * y_stride..];
-                let cbcr_row = &cbcr[(row / 2) * cbcr_stride..];
-                for (x, pixel) in out_row.chunks_exact_mut(4).enumerate() {
-                    let chroma = (x / 2) * 2;
-                    let (b, g, r) = if full_range {
-                        ycbcr_bt709_full_to_bgr(y_row[x], cbcr_row[chroma], cbcr_row[chroma + 1])
-                    } else {
-                        ycbcr_bt709_video_to_bgr(y_row[x], cbcr_row[chroma], cbcr_row[chroma + 1])
-                    };
-                    pixel[0] = b;
-                    pixel[1] = g;
-                    pixel[2] = r;
-                    pixel[3] = 255;
-                }
-            });
-    }
-
-    /// Packed 4:2:2 Y'CbCr -> BGRA, parallelized by row. `uyvy` selects the byte
-    /// order: UYVY (`2vuy`, Cb Y0 Cr Y1) when true, YUY2 (`yuvs`, Y0 Cb Y1 Cr) when false.
-    fn yuv422_to_bgra(
-        plane: &[u8],
-        stride: usize,
-        width: usize,
-        height: usize,
-        uyvy: bool,
-        out: &mut [u8],
-    ) {
-        let row_bytes = width * 4;
-        out.par_chunks_mut(row_bytes)
-            .enumerate()
-            .for_each(|(row, out_row)| {
-                if row >= height {
-                    return;
-                }
-                let src = &plane[row * stride..];
-                for (pair, out8) in out_row.chunks_exact_mut(8).enumerate() {
-                    let i = pair * 4;
-                    let (cb, y0, cr, y1) = if uyvy {
-                        (src[i], src[i + 1], src[i + 2], src[i + 3])
-                    } else {
-                        (src[i + 1], src[i], src[i + 3], src[i + 2])
-                    };
-                    let (b0, g0, r0) = ycbcr_bt709_video_to_bgr(y0, cb, cr);
-                    let (b1, g1, r1) = ycbcr_bt709_video_to_bgr(y1, cb, cr);
-                    out8[0] = b0;
-                    out8[1] = g0;
-                    out8[2] = r0;
-                    out8[3] = 255;
-                    out8[4] = b1;
-                    out8[5] = g1;
-                    out8[6] = r1;
-                    out8[7] = 255;
-                }
-            });
     }
 
     fn cm_time_seconds(time: CMTime) -> Option<f64> {
