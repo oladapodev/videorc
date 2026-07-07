@@ -2531,14 +2531,9 @@ export interface ReorderScreensParams {
 export interface RuntimeInfo {
   /** The running app version (`app.getVersion()`), shown in Settings → About. */
   version: string
+  /** `process.platform` — lets the renderer branch on OS (e.g. Linux uses the
+   * software JPEG preview instead of the macOS native Metal surface). */
   platform: string
-  arch: string
-  osRelease: string
-  gpuDevices: RuntimeGpuDevice[]
-  /** True when Videorc is running with hardware acceleration disabled — via
-   * VIDEORC_DISABLE_GPU=1 or the persisted GPU-crash fallback. Surfaced so
-   * support bundles name the active graphics mode. */
-  hardwareAccelerationDisabled: boolean
   isPackaged: boolean
   permissionTargetName: string
   permissionTargetPath: string

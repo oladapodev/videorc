@@ -630,6 +630,11 @@ export type StudioContextValue = {
   previewScreenStatus: PreviewScreenStatus
   previewSurfaceStatus: PreviewSurfaceStatus
   nativePreviewSurfaceEnabled: boolean
+  /** True where the preview is the software JPEG stream rendered inline (no
+   * macOS Metal surface) — Linux and any other non-Metal platform. */
+  softwarePreview: boolean
+  /** MJPEG stream URL for the inline software preview, or null. */
+  softwarePreviewUrl: string | null
   previewWindow: PreviewWindowState
   openPreviewWindow: () => Promise<void>
   closePreviewWindow: () => Promise<void>
@@ -2202,7 +2207,20 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   // One-shot playback toasts per broadcast+status (probe events may repeat).
   const xPlaybackToastsRef = useRef(new Set<string>())
   const [previewRefreshNonce, setPreviewRefreshNonce] = useState(0)
-  const nativePreviewSurfaceEnabled = Boolean(runtimeInfo?.nativePreviewSurfaceProofEnabled)
+  // The native preview surface is a macOS CAMetalLayer; other platforms use the
+  // software JPEG preview instead, so the native path must not claim to run.
+  const nativePreviewSurfaceEnabled =
+    Boolean(runtimeInfo?.nativePreviewSurfaceProofEnabled) && runtimeInfo?.platform === 'darwin'
+  // Linux (and any non-Metal platform) renders the compositor's output inline as
+  // an MJPEG stream the backend serves; the compositor is driven by an idle
+  // preview surface below.
+  const softwarePreview = runtimeInfo != null && runtimeInfo.platform !== 'darwin'
+  const softwarePreviewUrl =
+    softwarePreview && connection
+      ? `http://${connection.host}:${connection.port}/preview/live.mjpeg?token=${encodeURIComponent(
+          connection.token
+        )}`
+      : null
 
   // Surface a per-target stream drop from any tab (the Streaming tab has the full
   // banner + badges). Each failed destination toasts once per session; the set is
@@ -6123,229 +6141,24 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const isSessionActive =
     isActiveRecordingState(recording.state) || startRequestPending || stopRequestPending
 
-  // Every mic surface edits the same captureConfig. Mirror that one source of
-  // truth into the active backend-owned native audio session, scoped by the
-  // session id so a delayed update cannot mute/unmute the next capture.
+  // Linux software preview: keep an idle compositor running so the inline MJPEG
+  // preview always has the composited scene to show. A recording drives its own
+  // compositor (which feeds the same preview endpoint), so stand down while one
+  // is active and re-create the idle preview once it ends.
   useEffect(() => {
-    const params = activeAudioProcessingUpdateParams(
-      { state: recording.state, sessionId: recording.sessionId },
-      {
-        microphoneGainDb: captureConfig.audio.microphoneGainDb,
-        microphoneMuted: captureConfig.audio.microphoneMuted
-      }
-    )
-    if (!params) {
-      liveAudioProcessingSyncRef.current = null
+    if (!softwarePreview || !connection || wsStatus !== 'connected' || isSessionActive) {
       return
     }
-    if (!client || wsStatus !== 'connected') return
-
-    let sync = liveAudioProcessingSyncRef.current
-    if (!sync || sync.sessionId !== params.sessionId) {
-      sync = {
-        sessionId: params.sessionId,
-        lastApplied: {
-          microphoneGainDb: params.microphoneGainDb,
-          microphoneMuted: params.microphoneMuted
-        },
-        disabled: false,
-        requestRevision: 0
-      }
-      liveAudioProcessingSyncRef.current = sync
-    }
-
-    // Once this session proves it has no native post-controls path, keep every
-    // mic surface pinned to the last settings the backend actually accepted.
-    // A new capture session creates a fresh sync state and retries normally.
-    if (sync.disabled) {
-      if (
-        params.microphoneGainDb !== sync.lastApplied.microphoneGainDb ||
-        params.microphoneMuted !== sync.lastApplied.microphoneMuted
-      ) {
-        const rollback = sync.lastApplied
-        setCaptureConfig((current) => ({
-          ...current,
-          audio: { ...current.audio, ...rollback }
-        }))
-      }
+    const activeClient = clientRef.current
+    if (!activeClient) {
       return
     }
-
-    sync.requestRevision += 1
-    const requestRevision = sync.requestRevision
-    const lastApplied = sync.lastApplied
-
-    const rejectCurrentRequest = (
-      result?: AudioProcessingUpdateResult
-    ): ReturnType<typeof rejectedLiveAudioProcessingUpdate> => {
-      const latest = liveAudioProcessingSyncRef.current
-      if (
-        !latest ||
-        latest.sessionId !== params.sessionId ||
-        latest.requestRevision !== requestRevision
-      ) {
-        return null
-      }
-      const rejection = rejectedLiveAudioProcessingUpdate({
-        recording: recordingRef.current,
-        current: captureConfigRef.current.audio,
-        requested: params,
-        result,
-        lastApplied
-      })
-      if (!rejection) return null
-
-      latest.disabled = rejection.disableForSession
-      setCaptureConfig((current) => {
-        const currentRejection = rejectedLiveAudioProcessingUpdate({
-          recording: recordingRef.current,
-          current: current.audio,
-          requested: params,
-          result,
-          lastApplied
-        })
-        if (!currentRejection) return current
-        return {
-          ...current,
-          audio: { ...current.audio, ...currentRejection.rollback }
-        }
-      })
-      return rejection
+    const bounds = { screenX: 0, screenY: 0, width: 1280, height: 720, scaleFactor: 1 }
+    void activeClient.request('preview.surface.create', { bounds, targetFps: 30 }).catch(() => {})
+    return () => {
+      void clientRef.current?.request('preview.surface.destroy').catch(() => {})
     }
-
-    void client
-      .request<AudioProcessingUpdateResult>('audio.processing.update', params)
-      .then((result) => {
-        const latest = liveAudioProcessingSyncRef.current
-        if (
-          !latest ||
-          latest.sessionId !== params.sessionId ||
-          latest.requestRevision !== requestRevision ||
-          result.sessionId !== params.sessionId ||
-          recordingRef.current.sessionId !== params.sessionId ||
-          !['recording', 'streaming'].includes(recordingRef.current.state)
-        ) {
-          return
-        }
-        if (result.applied) {
-          latest.lastApplied = {
-            microphoneGainDb: result.microphoneGainDb,
-            microphoneMuted: result.microphoneMuted
-          }
-          return
-        }
-
-        const rejection = rejectCurrentRequest(result)
-        if (!rejection) return
-        reportError(new Error(rejection.message))
-      })
-      .catch((error) => {
-        const rejection = rejectCurrentRequest()
-        if (!rejection) return
-        const detail = error instanceof Error ? error.message : String(error)
-        reportError(new Error(`${rejection.message} ${detail}`))
-      })
-  }, [
-    client,
-    recording.sessionId,
-    recording.state,
-    captureConfig.audio.microphoneGainDb,
-    captureConfig.audio.microphoneMuted,
-    reportError,
-    wsStatus
-  ])
-
-  // Persisted consent is intent; the backend snapshot remains runtime truth.
-  // One attempt per capture/toggle/client edge prevents blocked/error states
-  // from spinning, while explicit retry edges deliberately try once again.
-  const captionsStartAttemptedRef = useRef(false)
-  const captionsStopAttemptedRef = useRef(false)
-  const captionsAttemptClientRef = useRef<BackendClient | null>(null)
-  const captionsAttemptScopeRef = useRef('')
-  const captionsCaptureActive = ['recording', 'streaming'].includes(recording.state)
-  const captionsAttemptScope = [
-    captureConfig.captions.enabled ? 'enabled' : 'disabled',
-    suppressCaptionsForSession ? 'suppressed' : 'normal',
-    captionsCaptureActive ? `capture:${recording.sessionId ?? 'unknown'}` : 'idle',
-    captureConfig.captions.language,
-    wsStatus
-  ].join(':')
-  useEffect(() => {
-    if (
-      captionsAttemptClientRef.current !== client ||
-      captionsAttemptScopeRef.current !== captionsAttemptScope
-    ) {
-      captionsAttemptClientRef.current = client
-      captionsAttemptScopeRef.current = captionsAttemptScope
-      captionsStartAttemptedRef.current = false
-      captionsStopAttemptedRef.current = false
-    }
-    if (!client || wsStatus !== 'connected' || captionsCommandPending) return
-    const action = decideCaptionsRuntimeIntent({
-      persistedEnabled: captureConfig.captions.enabled,
-      suppressForSession: suppressCaptionsForSession,
-      captureActive: captionsCaptureActive,
-      status: captionsStatus,
-      startAttempted: captionsStartAttemptedRef.current,
-      stopAttempted: captionsStopAttemptedRef.current
-    })
-    if (action === 'start') {
-      if (
-        captionRuntimeStartBlocked({
-          captureActive: captionsCaptureActive,
-          outputReadiness: captionOutputReadiness
-        })
-      ) {
-        setSuppressCaptionsForSession(true)
-        toast.error('Live captions cannot start in this session', {
-          id: 'captions-output-unsupported',
-          description:
-            captionOutputReadiness.description ??
-            'The active output configuration cannot carry caption pixels.'
-        })
-        return
-      }
-      captionsStartAttemptedRef.current = true
-      captionsStopAttemptedRef.current = false
-      void startCaptions(captureConfig.captions.language).catch((error: unknown) => {
-        toast.error('Live captions could not start', {
-          description:
-            error instanceof Error ? error.message : 'The caption service is unavailable.'
-        })
-      })
-    } else if (action === 'stop') {
-      captionsStartAttemptedRef.current = false
-      captionsStopAttemptedRef.current = true
-      void stopCaptions().catch(() => {})
-    }
-  }, [
-    captionsAttemptScope,
-    captionsCaptureActive,
-    captionsCommandPending,
-    captionOutputReadiness,
-    captionsStatus,
-    captureConfig.captions.enabled,
-    captureConfig.captions.language,
-    client,
-    startCaptions,
-    stopCaptions,
-    suppressCaptionsForSession,
-    wsStatus
-  ])
-
-  // A Go Live override survives confirmation and startup, then clears as soon
-  // as that attempted session returns to idle. Persisted consent never changes.
-  const suppressedCaptionSessionWasActiveRef = useRef(false)
-  useEffect(() => {
-    if (suppressCaptionsForSession && isSessionActive) {
-      suppressedCaptionSessionWasActiveRef.current = true
-      return
-    }
-    if (!isSessionActive && suppressedCaptionSessionWasActiveRef.current) {
-      suppressedCaptionSessionWasActiveRef.current = false
-      setSuppressCaptionsForSession(false)
-    }
-  }, [isSessionActive, suppressCaptionsForSession])
+  }, [softwarePreview, connection, wsStatus, isSessionActive])
 
   useEffect(() => {
     if (aiConsent && !currentCloudAiReadiness.ready) {
@@ -8828,6 +8641,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       previewUrl,
       previewLoading,
       nativePreviewSurfaceEnabled,
+      softwarePreview,
+      softwarePreviewUrl,
       previewWindow,
       openPreviewWindow,
       closePreviewWindow,
@@ -9000,6 +8815,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       previewUrl,
       previewLoading,
       nativePreviewSurfaceEnabled,
+      softwarePreview,
+      softwarePreviewUrl,
       previewWindow,
       openPreviewWindow,
       closePreviewWindow,
