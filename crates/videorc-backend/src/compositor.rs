@@ -2119,21 +2119,7 @@ struct PreparedGpuSource<'a> {
     dest: [f32; 4],
     crop: [f32; 4],
     mirror: bool,
-    mask: SceneMask,
-    /// Straight-alpha source-over blend (overlay bitmaps only — capture sources
-    /// must keep the opaque overwrite; see `GpuSource::blend`).
-    blend: bool,
-}
-
-#[cfg(target_os = "macos")]
-fn scene_mask_into_metal(mask: SceneMask) -> crate::metal_compositor::SourceMask {
-    match mask {
-        SceneMask::None => crate::metal_compositor::SourceMask::None,
-        SceneMask::Circle => crate::metal_compositor::SourceMask::Circle,
-        SceneMask::Rounded { radius_pct } => {
-            crate::metal_compositor::SourceMask::Rounded { radius_pct }
-        }
-    }
+    mask: SourceMask,
 }
 
 #[cfg(target_os = "macos")]
@@ -2220,6 +2206,7 @@ fn scene_source_kind_label(kind: &SceneSourceKind) -> &'static str {
     }
 }
 
+#[cfg(target_os = "macos")]
 /// Append the caption bar as the TOPMOST Metal image source. The bridge
 /// consumes Metal-composited surfaces directly, so the overlay must ride the
 /// GPU path (forcing CPU starves the VideoToolbox encoder — exit 187).
@@ -2292,10 +2279,7 @@ fn push_caption_overlay_gpu_source<'a>(
         dest,
         crop,
         mirror: false,
-        mask: SceneMask::None,
-        // The bar/card is rasterized on a transparent canvas; without blending
-        // its alpha-0 pixels overwrite the frame as an opaque black box.
-        blend: true,
+        mask: SourceMask::None,
     });
 }
 
@@ -2363,8 +2347,7 @@ fn try_gpu_compose(
                     dest,
                     crop,
                     mirror: false,
-                    mask: SceneMask::None,
-                    blend: false,
+                    mask: SourceMask::None,
                 });
                 true
             } else {
@@ -2421,8 +2404,7 @@ fn try_gpu_compose(
             dest,
             crop,
             mirror: false,
-            mask: SceneMask::None,
-            blend: false,
+            mask: SourceMask::None,
         });
         if let Some(overlay) = inputs.caption_overlay {
             let safe_inset = caption_overlay_safe_inset(
@@ -2491,8 +2473,7 @@ fn try_gpu_compose(
             dest,
             crop,
             mirror: false,
-            mask: SceneMask::None,
-            blend: false,
+            mask: SourceMask::None,
         });
         if let Some(overlay) = inputs.caption_overlay {
             let safe_inset = caption_overlay_safe_inset(
@@ -2650,8 +2631,7 @@ fn try_gpu_compose(
                         dest,
                         crop,
                         mirror: false,
-                        mask: SceneMask::None,
-                        blend: false,
+                        mask: SourceMask::None,
                     });
                 } else {
                     let placeholder =
@@ -2677,8 +2657,7 @@ fn try_gpu_compose(
                         dest,
                         crop,
                         mirror: false,
-                        mask: SceneMask::None,
-                        blend: false,
+                        mask: SourceMask::None,
                     });
                 }
             }
@@ -2705,8 +2684,7 @@ fn try_gpu_compose(
                     dest,
                     crop,
                     mirror: false,
-                    mask: SceneMask::None,
-                    blend: false,
+                    mask: SourceMask::None,
                 });
             }
         }
@@ -3451,7 +3429,7 @@ fn render_compositor_yuv420p_scene(inputs: CompositorRenderInputs<'_>, bytes: &m
                     CompositorSceneSourceFit::Contain
                 ),
                 mirror_x: false,
-                mask: SceneMask::None,
+                mask: SourceMask::None,
             },
         )
     {
@@ -3495,7 +3473,7 @@ fn render_compositor_yuv420p_scene(inputs: CompositorRenderInputs<'_>, bytes: &m
                             crop: scene_crop_from_transform(&transform),
                             contain: screen_contain,
                             mirror_x: false,
-                            mask: SceneMask::None,
+                            mask: SourceMask::None,
                         },
                     )
                 } else if let Some(frame) = screen_frame {
@@ -3514,7 +3492,7 @@ fn render_compositor_yuv420p_scene(inputs: CompositorRenderInputs<'_>, bytes: &m
                             crop: scene_crop_from_transform(&transform),
                             contain: screen_contain,
                             mirror_x: false,
-                            mask: SceneMask::None,
+                            mask: SourceMask::None,
                         },
                     )
                 } else {
@@ -3744,12 +3722,59 @@ enum SourcePixelFormat {
     Rgba,
 }
 
+/// Camera-bubble mask shared by both software compositors (the FFmpeg leg mirrors
+/// the same constants in its filter graph). Lives here rather than in the Metal
+/// module so the CPU compositor builds on every platform; the Metal shader
+/// packing helpers stay in `metal_compositor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceMask {
+    None,
+    Circle,
+    Rounded { radius_pct: u32 },
+}
+
 #[derive(Debug, Clone, Copy)]
 struct SourceRenderOptions {
     crop: SceneCrop,
     contain: bool,
     mirror_x: bool,
-    mask: SceneMask,
+    mask: SourceMask,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SourceCrop {
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+}
+
+impl SourceCrop {
+    fn none() -> Self {
+        Self {
+            left: 0.0,
+            top: 0.0,
+            right: 0.0,
+            bottom: 0.0,
+        }
+    }
+
+    fn kept_width(self) -> f64 {
+        (1.0 - self.left - self.right).max(0.001)
+    }
+
+    fn kept_height(self) -> f64 {
+        (1.0 - self.top - self.bottom).max(0.001)
+    }
+}
+
+fn source_crop_from_transform(transform: &SceneTransform) -> SourceCrop {
+    SourceCrop {
+        left: transform.crop_left.clamp(0.0, 0.95),
+        top: transform.crop_top.clamp(0.0, 0.95),
+        right: transform.crop_right.clamp(0.0, 0.95),
+        bottom: transform.crop_bottom.clamp(0.0, 0.95),
+    }
 }
 
 struct RgbaSource<'a> {
@@ -3807,7 +3832,7 @@ fn render_scene_background(
             crop: background_zoom_crop(Some(background)),
             contain: matches!(background.fit, BackgroundFit::Fit),
             mirror_x: false,
-            mask: SceneMask::None,
+            mask: SourceMask::None,
         },
     )
 }
@@ -3917,7 +3942,7 @@ fn render_synthetic_source_rect(
             crop: SceneCrop::none(),
             contain: false,
             mirror_x: false,
-            mask: SceneMask::None,
+            mask: SourceMask::None,
         },
     );
 }
@@ -4272,18 +4297,47 @@ fn map_source_pixel(
     Some((source_x, source_y))
 }
 
-fn source_mask_allows(mask: SceneMask, dest_x: usize, dest_y: usize, fit: &SourceFit) -> bool {
-    scene_mask_allows(
-        mask,
-        PixelRect {
-            x: fit.x,
-            y: fit.y,
-            width: fit.width,
-            height: fit.height,
-        },
-        dest_x,
-        dest_y,
-    )
+/// Whether `(dest_x, dest_y)` falls inside the largest circle inscribed in `fit`'s box
+/// — diameter `min(width, height)`, centered. A circle bubble must stay round even when
+/// the box is not perfectly square (the preview drawable's aspect drifts from the output's,
+/// so the "square" camera box renders slightly non-square). Using separate x/y radii here
+/// drew an ellipse; this matches the recording path's `circle_alpha_mask_filter` so the
+/// preview and the encoded file agree.
+fn source_mask_allows(mask: SourceMask, dest_x: usize, dest_y: usize, fit: &SourceFit) -> bool {
+    match mask {
+        SourceMask::None => true,
+        SourceMask::Circle => inside_circle(dest_x, dest_y, fit),
+        SourceMask::Rounded { radius_pct } => inside_rounded_rect(dest_x, dest_y, fit, radius_pct),
+    }
+}
+
+/// Whether `(dest_x, dest_y)` falls inside `fit`'s box with its corners clipped at
+/// `radius_pct`% of the shorter side — the same SDF the Metal shader and the FFmpeg
+/// rounded_alpha_mask_filter use, so preview and recording agree.
+fn inside_rounded_rect(dest_x: usize, dest_y: usize, fit: &SourceFit, radius_pct: u32) -> bool {
+    let radius = f64::from(fit.width.min(fit.height)) * f64::from(radius_pct.min(50)) / 100.0;
+    if radius <= 0.0 {
+        return true;
+    }
+    let center_x = f64::from(fit.x) + f64::from(fit.width) / 2.0;
+    let center_y = f64::from(fit.y) + f64::from(fit.height) / 2.0;
+    let inner_half_w = (f64::from(fit.width) / 2.0 - radius).max(0.0);
+    let inner_half_h = (f64::from(fit.height) / 2.0 - radius).max(0.0);
+    let qx = ((dest_x as f64 + 0.5 - center_x).abs() - inner_half_w).max(0.0);
+    let qy = ((dest_y as f64 + 0.5 - center_y).abs() - inner_half_h).max(0.0);
+    qx * qx + qy * qy <= radius * radius
+}
+
+fn inside_circle(dest_x: usize, dest_y: usize, fit: &SourceFit) -> bool {
+    let center_x = f64::from(fit.x) + f64::from(fit.width) / 2.0;
+    let center_y = f64::from(fit.y) + f64::from(fit.height) / 2.0;
+    let radius = f64::from(fit.width.min(fit.height)) / 2.0;
+    if radius <= 0.0 {
+        return false;
+    }
+    let dx = dest_x as f64 + 0.5 - center_x;
+    let dy = dest_y as f64 + 0.5 - center_y;
+    dx * dx + dy * dy <= radius * radius
 }
 
 fn source_pixel_len(source: &RgbaSource<'_>) -> usize {
@@ -4401,8 +4455,10 @@ fn compositor_scene_sources(
                     shape: if matches!(source.kind, SceneSourceKind::Camera) {
                         Some(if camera_circle_mask_applies(&snapshot.layout) {
                             CameraShape::Circle
-                        } else if matches!(camera_mask(&snapshot.layout), SceneMask::Rounded { .. })
-                        {
+                        } else if matches!(
+                            camera_source_mask(&snapshot.layout),
+                            SourceMask::Rounded { .. }
+                        ) {
                             CameraShape::Rounded
                         } else {
                             CameraShape::Rectangle
@@ -4521,7 +4577,24 @@ fn compositor_scene_source_fit(
 }
 
 fn camera_circle_mask_applies(layout: &LayoutSettings) -> bool {
-    matches!(camera_mask(layout), SceneMask::Circle)
+    matches!(layout.layout_preset, LayoutPreset::ScreenCamera)
+        && matches!(layout.camera_shape, CameraShape::Circle)
+}
+
+/// The camera bubble's mask for BOTH software compositors — one derivation,
+/// mirrored by the FFmpeg filter graph (rounded_alpha_mask_filter): circle
+/// inscribes min(w,h); rounded clips corners at radius_pct% of the shorter side.
+fn camera_source_mask(layout: &LayoutSettings) -> SourceMask {
+    if !matches!(layout.layout_preset, LayoutPreset::ScreenCamera) {
+        return SourceMask::None;
+    }
+    match layout.camera_shape {
+        CameraShape::Circle => SourceMask::Circle,
+        CameraShape::Rounded => SourceMask::Rounded {
+            radius_pct: layout.camera_corner_radius_pct.min(50),
+        },
+        CameraShape::Rectangle => SourceMask::None,
+    }
 }
 
 fn full_frame_transform() -> SceneTransform {
@@ -4966,7 +5039,7 @@ mod tests {
                 },
                 contain: false,
                 mirror_x: false,
-                mask: SceneMask::None,
+                mask: SourceMask::None,
             },
         ));
 
