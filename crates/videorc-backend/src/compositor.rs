@@ -1,6 +1,6 @@
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};

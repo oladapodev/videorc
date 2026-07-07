@@ -1,6 +1,6 @@
-#![cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "macos")]
 use crate::protocol::DeviceKind;
 use crate::protocol::{Device, DeviceStatus};
 

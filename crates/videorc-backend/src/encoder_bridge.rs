@@ -1,13 +1,11 @@
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
-#[cfg(target_os = "macos")]
-use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, Write as StdWrite};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "macos")]
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Condvar, Mutex as StdMutex, OnceLock};
 use std::thread;
@@ -28,7 +26,6 @@ use crate::diagnostics::{
     apply_runtime_diagnostics_snapshot, starting_diagnostics,
 };
 use crate::ffmpeg::resolve_ffmpeg_path;
-use crate::frame_store::FrameHandle;
 #[cfg(target_os = "macos")]
 use crate::mpeg_ts::{MpegTsH264Writer, timing_to_90khz};
 use crate::process_job::spawn_owned_tokio;

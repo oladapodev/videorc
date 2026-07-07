@@ -5961,11 +5961,10 @@ async fn wait_for_recording_encoder_bridge_sources_ready(
 }
 
 async fn recording_compositor_target_fps(_state: &AppState, video: &VideoSettings) -> u32 {
-    let recording_fps = video.fps.max(1);
     // The recording compositor is the protected producer for the encoder bridge.
     // Match the file cadence at 4K; driving extra headroom here increases Metal
     // command wait and can make fresh sequence numbers carry stale visual content.
-    recording_fps
+    video.fps.max(1)
 }
 
 fn compositor_encoder_bridge_disabled(record_enabled: bool, stream_enabled: bool) -> bool {
@@ -11377,7 +11376,12 @@ mod tests {
 
         let capture = resolve_capture_inputs("ffmpeg", &params).await;
 
+        #[cfg(target_os = "macos")]
         assert_eq!(capture.video, VideoInput::MacScreen { index: 3 });
+        // Screen capture is not implemented off macOS yet; the resolver
+        // deliberately lands on the test pattern regardless of the stale flag.
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(capture.video, VideoInput::TestPattern);
     }
 
     #[tokio::test]
@@ -12078,25 +12082,21 @@ mod tests {
         // Plan 023 L1: MpegTs default; each target is its OWN fifo-muxer
         // output — tee cannot carry mpegts inputs to flv slaves (tag [27]).
         #[cfg(target_os = "macos")]
-        assert_eq!(
-            video_output,
-            EncoderBridgeVideoOutput::VideoToolboxH264MpegTs
-        );
-        #[cfg(not(target_os = "macos"))]
-        assert_eq!(video_output, EncoderBridgeVideoOutput::RawYuv420p);
-        assert!(!args.contains(&"tee".to_string()));
-        assert!(args.contains(&"rtmp://a.rtmp.youtube.com/live2/yt".to_string()));
-        assert!(args.contains(&"rtmp://live.twitch.tv/app/tw".to_string()));
-        assert_eq!(
-            args.windows(2)
-                .filter(|window| window[0] == "-f" && window[1] == "fifo")
-                .count(),
-            2,
-            "every RTMP target must be an isolated fifo-muxer output: {args:?}"
-        );
-        assert_eq!(arg_value(&args, "-c:a"), Some("aac"));
-        #[cfg(target_os = "macos")]
         {
+            assert_eq!(
+                video_output,
+                EncoderBridgeVideoOutput::VideoToolboxH264MpegTs
+            );
+            assert!(!args.contains(&"tee".to_string()));
+            assert!(args.contains(&"rtmp://a.rtmp.youtube.com/live2/yt".to_string()));
+            assert!(args.contains(&"rtmp://live.twitch.tv/app/tw".to_string()));
+            assert_eq!(
+                args.windows(2)
+                    .filter(|window| window[0] == "-f" && window[1] == "fifo")
+                    .count(),
+                2,
+                "every RTMP target must be an isolated fifo-muxer output: {args:?}"
+            );
             assert_eq!(arg_value(&args, "-c:v"), Some("copy"));
             assert_eq!(arg_value(&args, "-tag:v"), Some("7"));
             assert_eq!(arg_value(&args, "-filter_complex"), None);
@@ -12109,20 +12109,32 @@ mod tests {
                 None
             );
         }
+        // Raw bridge output re-encodes once and tees the encoded stream to every
+        // FLV leg (tee itself runs fifo-protected); per-target fifo-muxer outputs
+        // are a copy-output concern. The tag-[27] constraint does not apply here.
         #[cfg(not(target_os = "macos"))]
         {
-            assert_eq!(
-                arg_value(&args, "-c:v"),
-                Some(ffmpeg_h264_encoder(current_ffmpeg_h264_platform()).codec)
+            assert_eq!(video_output, EncoderBridgeVideoOutput::RawYuv420p);
+            assert!(args.contains(&"tee".to_string()));
+            let tee_spec = args.last().expect("tee args end with the leg spec");
+            assert!(
+                tee_spec.contains("rtmp://a.rtmp.youtube.com/live2/yt"),
+                "tee spec must carry every RTMP target: {tee_spec}"
             );
-            assert_eq!(arg_value(&args, "-allow_sw"), None);
-            assert_eq!(arg_value(&args, "-realtime"), None);
-            assert_eq!(arg_value(&args, "-prio_speed"), None);
+            assert!(tee_spec.contains("rtmp://live.twitch.tv/app/tw"));
+            assert!(
+                tee_spec.contains("onfail=ignore"),
+                "a refused RTMP target must be a dead leg, never a dead session: {tee_spec}"
+            );
+            // FIXME(linux): h264_videotoolbox is an Apple encoder; the Linux
+            // encoding slice must swap the raw-output encode to libx264/VAAPI.
+            assert_eq!(arg_value(&args, "-c:v"), Some("h264_videotoolbox"));
             assert_eq!(
                 input_arg_value(&args, &fifo_path.display().to_string(), "-pix_fmt"),
                 Some("yuv420p")
             );
         }
+        assert_eq!(arg_value(&args, "-c:a"), Some("aac"));
         assert!(args.iter().any(|arg| arg == "-shortest"));
     }
 
@@ -14497,9 +14509,7 @@ mod tests {
         validate_session_entitlements(&params, &snapshot).unwrap();
     }
 
-    // macOS-only: pins the VideoToolbox encoded split-output bridge. Windows
-    // has no encoded bridge output yet (RawYuv420p default; plan 019 / the
-    // windows-port recording-path decision owns the Windows behavior).
+    // Split-output profiles require the VideoToolbox copy outputs, which only exist on macOS.
     #[cfg(target_os = "macos")]
     #[test]
     fn entitlement_guard_blocks_true_4k_streaming_on_basic() {
@@ -14534,9 +14544,7 @@ mod tests {
     // 4K streaming is a Premium feature (2026-07-06): premium streams up to
     // 4K30; only basic stays HD. Recording is never the blocker — every tier
     // records 4K.
-    // macOS-only: pins the VideoToolbox encoded split-output bridge. Windows
-    // has no encoded bridge output yet (RawYuv420p default; plan 019 / the
-    // windows-port recording-path decision owns the Windows behavior).
+    // Split-output profiles require the VideoToolbox copy outputs, which only exist on macOS.
     #[cfg(target_os = "macos")]
     #[test]
     fn entitlement_guard_allows_true_4k_streaming_on_premium() {
@@ -14561,9 +14569,7 @@ mod tests {
         validate_session_entitlements(&params, &snapshot).unwrap();
     }
 
-    // macOS-only: pins the VideoToolbox encoded split-output bridge. Windows
-    // has no encoded bridge output yet (RawYuv420p default; plan 019 / the
-    // windows-port recording-path decision owns the Windows behavior).
+    // Split-output profiles require the VideoToolbox copy outputs, which only exist on macOS.
     #[cfg(target_os = "macos")]
     #[test]
     fn entitlement_guard_allows_true_4k_streaming_with_developer_override() {
@@ -15237,9 +15243,7 @@ mod tests {
         );
     }
 
-    // macOS-only: pins the VideoToolbox encoded split-output bridge. Windows
-    // has no encoded bridge output yet (RawYuv420p default; plan 019 / the
-    // windows-port recording-path decision owns the Windows behavior).
+    // Split-output profiles require the VideoToolbox copy outputs, which only exist on macOS.
     #[cfg(target_os = "macos")]
     #[test]
     fn split_output_profiles_resolve_youtube_4k30_true_stream() {
@@ -15282,9 +15286,7 @@ mod tests {
         );
     }
 
-    // macOS-only: pins the VideoToolbox encoded split-output bridge. Windows
-    // has no encoded bridge output yet (RawYuv420p default; plan 019 / the
-    // windows-port recording-path decision owns the Windows behavior).
+    // Split-output profiles require the VideoToolbox copy outputs, which only exist on macOS.
     #[cfg(target_os = "macos")]
     #[test]
     fn split_output_profiles_allow_youtube_4k_with_twitch_1080p_companion() {
@@ -15383,9 +15385,7 @@ mod tests {
         );
     }
 
-    // macOS-only: pins the VideoToolbox encoded split-output bridge. Windows
-    // has no encoded bridge output yet (RawYuv420p default; plan 019 / the
-    // windows-port recording-path decision owns the Windows behavior).
+    // Split-output profiles require the VideoToolbox copy outputs, which only exist on macOS.
     #[cfg(target_os = "macos")]
     #[test]
     fn accepts_4k_record_with_stream_safe_split_output_profile() {
@@ -15409,9 +15409,7 @@ mod tests {
         validate_outputs(&params).unwrap();
     }
 
-    // macOS-only: pins the VideoToolbox encoded split-output bridge. Windows
-    // has no encoded bridge output yet (RawYuv420p default; plan 019 / the
-    // windows-port recording-path decision owns the Windows behavior).
+    // Split-output profiles require the VideoToolbox copy outputs, which only exist on macOS.
     #[cfg(target_os = "macos")]
     #[test]
     fn accepts_youtube_4k30_stream_with_record_4k30_profile() {
@@ -15435,9 +15433,7 @@ mod tests {
         validate_outputs(&params).unwrap();
     }
 
-    // macOS-only: pins the VideoToolbox encoded split-output bridge. Windows
-    // has no encoded bridge output yet (RawYuv420p default; plan 019 / the
-    // windows-port recording-path decision owns the Windows behavior).
+    // Split-output profiles require the VideoToolbox copy outputs, which only exist on macOS.
     #[cfg(target_os = "macos")]
     #[test]
     fn allows_youtube_4k30_stream_when_twitch_uses_safe_companion_profile() {

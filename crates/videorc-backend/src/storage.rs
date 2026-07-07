@@ -6006,6 +6006,16 @@ mod tests {
         assert!(rendered.ends_with("videorc.sqlite3"));
     }
 
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn default_database_path_uses_dot_videorc_elsewhere() {
+        let path = default_database_path();
+        let rendered = path.display().to_string();
+
+        assert!(rendered.contains(".videorc"));
+        assert!(rendered.ends_with("videorc.sqlite3"));
+    }
+
     #[test]
     fn session_payload_round_trips_through_json() {
         let layout = LayoutSettings {
