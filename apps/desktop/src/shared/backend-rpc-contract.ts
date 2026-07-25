@@ -8,6 +8,8 @@ import type {
   FileAssessment,
   GateStatus,
   LiveLayoutApplyStatus,
+  MediaBackendPolicyContract,
+  MediaPolicyRequest,
   NoiseCleanupJob,
   OAuthCallbackResult,
   OAuthCompleteParams,
