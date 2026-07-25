@@ -1,3 +1,5 @@
+#![cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -8,6 +10,7 @@ use crate::audio::{
     AudioProcessingSettings, list_native_microphones, parse_coreaudio_microphone_id,
     sample_native_audio_meter,
 };
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use crate::camera_capture::list_native_cameras;
 use crate::ffmpeg::resolve_ffmpeg_path;
 use crate::process_job::output_owned_tokio;

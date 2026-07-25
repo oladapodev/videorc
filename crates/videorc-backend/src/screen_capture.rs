@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use crate::protocol::{Device, DeviceKind, DeviceStatus};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use crate::protocol::DeviceKind;
+use crate::protocol::{Device, DeviceStatus};
 
 const SCREEN_CAPTUREKIT_PREFIX: &str = "screen:screencapturekit:";
 const WINDOW_CAPTUREKIT_PREFIX: &str = "window:screencapturekit:";
