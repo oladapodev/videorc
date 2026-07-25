@@ -1635,6 +1635,18 @@ async fn run_synthetic_compositor_loop(
             }
             _ = ticker.tick() => {
                 let ticked_at = Instant::now();
+                // The preview surface can change orientation without restarting the
+                // compositor. Read the authoritative dimensions for this run on each
+                // tick so published frames follow that live resize instead of keeping
+                // the render loop's spawn-time dimensions.
+                let (frame_width, frame_height) = {
+                    let compositor = state.compositor.lock().await;
+                    if compositor.run_id.as_deref() == Some(run_id.as_str()) {
+                        (compositor.status.width, compositor.status.height)
+                    } else {
+                        (width, height)
+                    }
+                };
                 if let Some(previous_tick_at) = previous_tick_at {
                     let tick_gap_ms =
                         ticked_at.duration_since(previous_tick_at).as_secs_f64() * 1000.0;
@@ -1663,8 +1675,8 @@ async fn run_synthetic_compositor_loop(
                         &state,
                         &run_id,
                         frames_rendered,
-                        width,
-                        height,
+                        frame_width,
+                        frame_height,
                         &mut live_sources,
                         &mut render_cache,
                         gpu_compositor.as_mut(),
