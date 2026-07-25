@@ -9262,6 +9262,7 @@ pub type LivePreviewSlot = Arc<Mutex<LivePreviewState>>;
 mod tests {
     use super::*;
     use crate::capture_input::AVFOUNDATION_VIDEO_PIXEL_FORMAT;
+    #[cfg(target_os = "macos")]
     use crate::protocol::EntitlementSource;
     use crate::protocol::PreviewSurfaceState;
     use crate::protocol::{
@@ -9900,6 +9901,7 @@ mod tests {
                 microphone_sync_offset_ms: 0,
                 ..Default::default()
             },
+            media_policy: Default::default(),
             streaming: None,
         }
     }

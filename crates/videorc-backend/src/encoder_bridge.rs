@@ -4625,7 +4625,9 @@ mod tests {
         assert!(recording_queue_drop_watch_update(&mut watch, "s2", 2));
     }
 
-    use crate::compositor::{CompositorFrameExportHandle, CompositorPixelFormat};
+    #[cfg(target_os = "macos")]
+    use crate::compositor::CompositorFrameExportHandle;
+    use crate::compositor::CompositorPixelFormat;
     #[cfg(target_os = "macos")]
     use crate::metal_compositor::{GpuSource, GpuSourceKind, MetalSceneCompositor};
 

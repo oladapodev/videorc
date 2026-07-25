@@ -3543,7 +3543,8 @@ mod tests {
     fn shared_high_risk_contract_fixture_includes_media_policy_contract() {
         let media_policy_wire = shared_high_risk_contract_fixture_value("/mediaPolicyProfile/wire");
         let media_policy: crate::media_policy::MediaPolicySelection =
-            serde_json::from_value(media_policy_wire).expect("media policy should deserialize");
+            serde_json::from_value(media_policy_wire.clone())
+                .expect("media policy should deserialize");
         let media_policy_normalized: serde_json::Value = serde_json::json!(media_policy);
         let expected = shared_high_risk_contract_fixture_value("/mediaPolicyProfile/normalized");
         assert_eq!(media_policy_normalized, expected);
