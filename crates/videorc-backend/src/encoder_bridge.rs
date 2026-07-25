@@ -8,7 +8,6 @@ use std::io::{self, Write as StdWrite};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(target_os = "macos")]
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Condvar, Mutex as StdMutex, OnceLock};
 use std::thread;
