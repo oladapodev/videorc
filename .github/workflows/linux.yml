@@ -142,7 +142,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@v4
+        uses: Swatinem/rust-cache@v2
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
@@ -213,7 +213,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@v4
+        uses: Swatinem/rust-cache@v2
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
