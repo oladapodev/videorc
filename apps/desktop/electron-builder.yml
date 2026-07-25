@@ -123,6 +123,7 @@ linux:
   icon: build-resources/icon.icns
   category: AudioVideo
   executableName: videorc
+  maintainer: oladapodev <oladapodev@users.noreply.github.com>
   target:
     - target: deb
       arch:
