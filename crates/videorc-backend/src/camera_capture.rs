@@ -1,3 +1,5 @@
+#![cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+
 use crate::protocol::{Device, DeviceKind, DeviceStatus};
 
 const NATIVE_CAMERA_PREFIX: &str = "camera:avfoundation-native:";

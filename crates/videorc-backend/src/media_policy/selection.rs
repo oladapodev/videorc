@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::media_policy::{BenchmarkPreset, MediaPolicyPreset, MediaPolicySelection};
 
 /// Normalized policy selection where unrecognized preset strings are treated as
