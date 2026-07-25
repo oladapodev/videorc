@@ -66,13 +66,13 @@ export async function buildLinuxBuildInfo({ artifactPath, repoRoot = process.cwd
 export async function writeLinuxBuildInfo({ artifactPath, outputPath, repoRoot = process.cwd() }) {
   const buildInfo = await buildLinuxBuildInfo({ artifactPath, repoRoot })
   await import('node:fs/promises').then(async ({ writeFile }) => {
-    await writeFile(outputPath, JSON.stringify(buildInfo, null, 2) + '\\n', 'utf8')
+    await writeFile(outputPath, JSON.stringify(buildInfo, null, 2) + '\n', 'utf8')
   })
   if (buildInfo.artifacts.mainDeb?.sha256) {
     await import('node:fs/promises').then(async ({ writeFile }) => {
       await writeFile(
         buildInfo.artifacts.mainDeb.sha256File,
-        `${buildInfo.artifacts.mainDeb.sha256}  ${artifactPath}\\n`,
+        `${buildInfo.artifacts.mainDeb.sha256}  ${artifactPath}\n`,
         'utf8'
       )
     })
