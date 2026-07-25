@@ -545,7 +545,21 @@ pub(crate) fn capture_session_file_object_identity_from_file(
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
+        Ok(SessionFileObjectIdentity {
+            volume_id: metadata.dev(),
+            // Linux can recycle an inode immediately after unlink (notably on
+            // overlayfs). Mix the birth timestamp into the persisted identity
+            // so crash recovery cannot mistake a replacement for our file.
+            file_id: linux_file_object_id(file.as_raw_fd(), metadata.ino(), path)?,
+        })
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         use std::os::unix::fs::MetadataExt;
         Ok(SessionFileObjectIdentity {
@@ -570,6 +584,36 @@ pub(crate) fn capture_session_file_object_identity_from_file(
             path.display()
         )
     }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_file_object_id(fd: std::os::fd::RawFd, inode: u64, path: &Path) -> Result<u64> {
+    let mut statx = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    let empty_path = b"\0";
+    let result = unsafe {
+        libc::statx(
+            fd,
+            empty_path.as_ptr().cast(),
+            libc::AT_EMPTY_PATH | libc::AT_STATX_SYNC_AS_STAT,
+            libc::STATX_INO | libc::STATX_BTIME,
+            statx.as_mut_ptr(),
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "Could not inspect Linux object identity for {}",
+                path.display()
+            )
+        });
+    }
+    let statx = unsafe { statx.assume_init() };
+    if statx.stx_mask & libc::STATX_BTIME == 0 {
+        return Ok(inode);
+    }
+    let birth_seconds = u64::from_ne_bytes(statx.stx_btime.tv_sec.to_ne_bytes());
+    let birth_nanos = u64::from(statx.stx_btime.tv_nsec);
+    Ok(inode ^ birth_seconds.rotate_left(21) ^ birth_nanos.rotate_left(42))
 }
 
 #[cfg(target_os = "windows")]
@@ -691,7 +735,36 @@ pub(crate) fn session_media_path_state(path: &Path) -> SessionMediaPathState {
 pub(crate) fn capture_session_directory_object_identity(
     path: &Path,
 ) -> Result<Option<SessionFileObjectIdentity>> {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = match File::open(path) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Could not open session directory {}", path.display())
+                });
+            }
+        };
+        let metadata = directory
+            .metadata()
+            .with_context(|| format!("Could not inspect session directory {}", path.display()))?;
+        if !metadata.is_dir() {
+            bail!(
+                "Session staging directory {} is not a directory.",
+                path.display()
+            );
+        }
+        Ok(Some(SessionFileObjectIdentity {
+            volume_id: metadata.dev(),
+            file_id: linux_file_object_id(directory.as_raw_fd(), metadata.ino(), path)?,
+        }))
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         use std::os::unix::fs::MetadataExt;
 
@@ -5923,6 +5996,7 @@ mod tests {
         assert_eq!(database.reconcile_orphaned_sessions().unwrap(), 0);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn default_database_path_uses_application_support_on_macos() {
         let path = default_database_path();

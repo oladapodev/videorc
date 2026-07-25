@@ -106,7 +106,7 @@ pub struct MediaBackendPolicy {
     pub preview: MediaPreviewBackendId,
     pub recording_encoder: MediaEncoderBackendId,
     pub streaming_encoder: MediaEncoderBackendId,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub benchmark_recommendation: Option<BenchmarkPreset>,
 }
 
@@ -151,7 +151,7 @@ pub struct MediaPolicySelection {
     pub selected: MediaBackendPolicy,
     #[serde(default)]
     pub fallback_mode: MediaPolicyFallbackMode,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
     #[serde(default)]
     pub capability_verdict: MediaPolicyCapabilityVerdict,
