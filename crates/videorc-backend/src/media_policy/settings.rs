@@ -143,7 +143,7 @@ impl Default for MediaPolicyRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MediaPolicySelection {
     #[serde(default)]
     pub requested: MediaPolicyRequest,
