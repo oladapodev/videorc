@@ -30,9 +30,20 @@ if (!appExecutable) {
   process.exit(1)
 }
 
+const smokeScriptArgs = [
+  resolve(process.cwd(), 'scripts', 'smoke-packaged-app.mjs'),
+  '--require-bundled-ffmpeg'
+]
+// Intent: GitHub runners have no interactive Linux display. Benefit: CI still
+// launches and records with the real packaged Electron app under an isolated X
+// server, while developer machines continue using their existing display.
+const smokeCommand = process.env.CI === 'true' ? 'xvfb-run' : 'node'
+const smokeArgs =
+  process.env.CI === 'true' ? ['--auto-servernum', 'node', ...smokeScriptArgs] : smokeScriptArgs
+
 const smoke = spawnSync(
-  'node',
-  [resolve(process.cwd(), 'scripts', 'smoke-packaged-app.mjs'), '--require-bundled-ffmpeg'],
+  smokeCommand,
+  smokeArgs,
   {
     stdio: 'inherit',
     env: {
@@ -44,7 +55,8 @@ const smoke = spawnSync(
       VIDEORC_SMOKE_VIDEO_WIDTH: '1280',
       VIDEORC_SMOKE_VIDEO_HEIGHT: '720',
       VIDEORC_SMOKE_VIDEO_FPS: '30',
-      VIDEORC_SMOKE_VIDEO_BITRATE_KBPS: '4000'
+      VIDEORC_SMOKE_VIDEO_BITRATE_KBPS: '4000',
+      VIDEORC_PACKAGED_SMOKE_NO_SANDBOX: process.env.CI === 'true' ? '1' : '0'
     }
   }
 )
