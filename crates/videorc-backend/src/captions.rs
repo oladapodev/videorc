@@ -1,3 +1,5 @@
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 //! Live captions: taps microphone PCM off the native audio pipeline and
 //! transcribes it through videorc-web, streaming-first (S2): the gateway
 //! realtime WebSocket (voice-model input-audio transcription events, ~1s

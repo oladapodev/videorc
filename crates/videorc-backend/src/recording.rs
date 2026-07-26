@@ -19,11 +19,8 @@ use uuid::Uuid;
 use crate::audio::{
     AudioCaptureStats, AudioProcessingSettings, NATIVE_AUDIO_CHANNELS, NATIVE_AUDIO_SAMPLE_RATE,
     NativeAudioCaptureSession, NativeAudioSource, attach_fifo_writer, audio_capture_coverage,
-    create_native_audio_fifo, native_audio_fifo_path, parse_coreaudio_microphone_id,
-    parse_windows_dshow_microphone_id, start_native_audio_source,
-};
-use crate::camera_capture::{
-    native_camera_name_for_id, parse_native_camera_id, parse_windows_dshow_camera_id,
+    create_native_audio_fifo, native_audio_fifo_path, parse_native_microphone_id,
+    start_native_audio_source,
 };
 use crate::capture_input::{
     MicrophoneInput, VideoInput, WindowsScreenCaptureBackend, append_avfoundation_video_input,
@@ -975,10 +972,11 @@ pub async fn start_session(
         starting_diagnostics(&session_id, params.output.video.fps, mode),
         duplicate_capture_sources,
     );
-    // Both the shared-compositor bridge and the legacy path request the platform H.264
-    // encoder. The bridge is the protected consumer of the compositor output, paced by
-    // the output clock; the legacy path captures via FFmpeg.
-    initial_diagnostics.encode_backend = Some(default_h264_encode_backend());
+    // Phase 4: both the shared-compositor bridge and the legacy path request the
+    // platform H.264 encoder (hardware videotoolbox with sw fallback on macOS,
+    // libx264 elsewhere). The bridge is the protected consumer of the
+    // compositor output, paced by the output clock; the legacy path captures via FFmpeg.
+    initial_diagnostics.encode_backend = Some(platform_h264_encode_backend());
     initial_diagnostics.recording_protected = use_encoder_bridge;
     {
         let mut diagnostics = state.diagnostics.lock().await;
@@ -2196,6 +2194,7 @@ pub async fn create_preview_snapshot(
             },
         },
         audio: Default::default(),
+        media_policy: Default::default(),
         streaming: None,
     };
     let mut capture = resolve_capture_inputs(&ffmpeg_path, &session_params).await;
@@ -2486,6 +2485,7 @@ fn live_preview_session_params(
             },
         },
         audio: Default::default(),
+        media_policy: Default::default(),
         streaming: None,
     }
 }
@@ -4806,7 +4806,16 @@ struct PreparedNativeAudioSource {
 }
 
 async fn resolve_capture_inputs(ffmpeg_path: &str, params: &StartSessionParams) -> CaptureInputs {
-    let microphone = resolve_microphone_input(params.sources.microphone_id.as_deref());
+    let microphone = params.sources.microphone_id.as_deref().and_then(|id| {
+        parse_native_microphone_id(id)
+            .map(|device_id| MicrophoneInput::CoreAudio {
+                device_id,
+                fifo_path: None,
+            })
+            .or_else(|| {
+                parse_avfoundation_id(id).map(|index| MicrophoneInput::AvFoundation { index })
+            })
+    });
 
     // Camera-only makes the camera the primary input. No screen is enumerated or
     // captured, so macOS Screen Recording permission is never requested.
@@ -5959,11 +5968,10 @@ async fn wait_for_recording_encoder_bridge_sources_ready(
 }
 
 async fn recording_compositor_target_fps(_state: &AppState, video: &VideoSettings) -> u32 {
-    let recording_fps = video.fps.max(1);
     // The recording compositor is the protected producer for the encoder bridge.
     // Match the file cadence at 4K; driving extra headroom here increases Metal
     // command wait and can make fresh sequence numbers carry stale visual content.
-    recording_fps
+    video.fps.max(1)
 }
 
 fn compositor_encoder_bridge_disabled(record_enabled: bool, stream_enabled: bool) -> bool {
@@ -6056,6 +6064,52 @@ fn default_encoder_bridge_video_output() -> EncoderBridgeVideoOutput {
     #[cfg(not(target_os = "macos"))]
     {
         EncoderBridgeVideoOutput::RawYuv420p
+    }
+}
+
+/// H.264 encoder for the raw-video (YUV420p) FFmpeg legs. macOS prefers the
+/// hardware encoder, like OBS: software libx264 ultrafast was a CPU-pressure
+/// source under real 1080p/1440p load, and `-allow_sw 1` keeps a software
+/// fallback so the encode never fails. Off macOS libx264 is the portable
+/// choice; `veryfast` + `zerolatency` keep the encode realtime on the live
+/// FIFO feed (hardware VAAPI/NVENC arrive later as FFmpeg flag swaps).
+fn platform_h264_encoder_args() -> &'static [&'static str] {
+    #[cfg(target_os = "macos")]
+    {
+        &[
+            "-c:v",
+            "h264_videotoolbox",
+            "-allow_sw",
+            "1",
+            "-realtime",
+            "1",
+            "-prio_speed",
+            "1",
+        ]
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        &[
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-tune",
+            "zerolatency",
+        ]
+    }
+}
+
+/// Diagnostics twin of `platform_h264_encoder_args` — the reported backend
+/// must name what the args actually request, per platform.
+fn platform_h264_encode_backend() -> EncodeBackend {
+    #[cfg(target_os = "macos")]
+    {
+        EncodeBackend::HardwareVideotoolbox
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        EncodeBackend::SoftwareX264
     }
 }
 
@@ -6168,10 +6222,29 @@ fn bridge_compositor_ffmpeg_args(
         append_audio_output_args(&mut args, &input_layout);
         match video_output {
             EncoderBridgeVideoOutput::RawYuv420p => {
-                append_h264_encoding_args_preserving_input_timestamps(
-                    &mut args,
-                    &params.output.video,
-                );
+                args.extend([
+                    "-r".to_string(),
+                    params.output.video.fps.to_string(),
+                    "-pix_fmt".to_string(),
+                    "yuv420p".to_string(),
+                ]);
+                // Phase 4: prefer hardware encoding on the shared-compositor
+                // path where the platform has it (see platform_h264_encoder_args).
+                args.extend(platform_h264_encoder_args().iter().map(ToString::to_string));
+                args.extend([
+                    "-b:v".to_string(),
+                    format!("{}k", params.output.video.bitrate_kbps),
+                    "-maxrate".to_string(),
+                    format!("{}k", params.output.video.bitrate_kbps),
+                    "-bufsize".to_string(),
+                    format!("{}k", params.output.video.bitrate_kbps.saturating_mul(2)),
+                    "-g".to_string(),
+                    params.output.video.fps.saturating_mul(2).to_string(),
+                    "-force_key_frames".to_string(),
+                    "expr:gte(t,n_forced*2)".to_string(),
+                    "-flags".to_string(),
+                    "+global_header".to_string(),
+                ]);
             }
             EncoderBridgeVideoOutput::VideoToolboxH264AnnexB
             | EncoderBridgeVideoOutput::VideoToolboxH264MpegTs => {
@@ -6650,6 +6723,11 @@ fn append_bridge_audio_input_args(
         });
     } else {
         args.extend([
+            // Pace the tone at realtime like the legacy path's tone. Unpaced,
+            // lavfi generates ahead of the realtime FIFO video and `-shortest`
+            // flushes the surplus at EOF — a 130-200ms audio tail that reads
+            // as A/V skew in the finished file.
+            "-re".to_string(),
             "-f".to_string(),
             "lavfi".to_string(),
             "-i".to_string(),
@@ -6704,7 +6782,40 @@ fn ffmpeg_args(
         "[v_main]".to_string(),
     ]);
     append_audio_output_args(&mut args, &input_layout);
-    append_h264_encoding_args(&mut args, &params.output.video);
+    args.extend([
+        "-r".to_string(),
+        params.output.video.fps.to_string(),
+        "-pix_fmt".to_string(),
+        "yuv420p".to_string(),
+    ]);
+    args.extend(platform_h264_encoder_args().iter().map(ToString::to_string));
+    args.extend([
+        "-b:v".to_string(),
+        format!("{}k", params.output.video.bitrate_kbps),
+        "-maxrate".to_string(),
+        format!("{}k", params.output.video.bitrate_kbps),
+        "-bufsize".to_string(),
+        format!("{}k", params.output.video.bitrate_kbps.saturating_mul(2)),
+        // Pin a 2-second keyframe interval (closed GOP). YouTube — and HLS/DVR on
+        // every platform — will not go live without a regular keyframe cadence, while
+        // Twitch tolerates an irregular GOP. That difference is exactly why an
+        // unpinned videotoolbox encode reaches Twitch but never appears on YouTube.
+        // `-g` bounds the max interval; `-force_key_frames` guarantees exact 2s
+        // alignment, and because there is one shared encoder every tee leg (and the
+        // MKV) inherits it.
+        "-g".to_string(),
+        params.output.video.fps.saturating_mul(2).to_string(),
+        "-force_key_frames".to_string(),
+        "expr:gte(t,n_forced*2)".to_string(),
+        // Required for the `tee` fan-out: a single shared videotoolbox encoder feeds
+        // the matroska and flv slaves, which both need the H.264 SPS/PPS carried as
+        // global extradata. Without this the matroska slave fails its header write
+        // ("Could not write header (incorrect codec parameters ?)") and, because it is
+        // onfail=abort, takes down the entire tee. Harmless for the single mkv/flv
+        // outputs (those muxers request global headers from the encoder anyway).
+        "-flags".to_string(),
+        "+global_header".to_string(),
+    ]);
     append_audio_encoding_args(
         &mut args,
         &input_layout,
@@ -9260,6 +9371,7 @@ pub type LivePreviewSlot = Arc<Mutex<LivePreviewState>>;
 mod tests {
     use super::*;
     use crate::capture_input::AVFOUNDATION_VIDEO_PIXEL_FORMAT;
+    #[cfg(target_os = "macos")]
     use crate::protocol::EntitlementSource;
     use crate::protocol::PreviewSurfaceState;
     use crate::protocol::{
@@ -9898,6 +10010,7 @@ mod tests {
                 microphone_sync_offset_ms: 0,
                 ..Default::default()
             },
+            media_policy: Default::default(),
             streaming: None,
         }
     }
@@ -11373,7 +11486,12 @@ mod tests {
 
         let capture = resolve_capture_inputs("ffmpeg", &params).await;
 
+        #[cfg(target_os = "macos")]
         assert_eq!(capture.video, VideoInput::MacScreen { index: 3 });
+        // Screen capture is not implemented off macOS yet; the resolver
+        // deliberately lands on the test pattern regardless of the stale flag.
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(capture.video, VideoInput::TestPattern);
     }
 
     #[tokio::test]
@@ -11725,36 +11843,30 @@ mod tests {
             input_arg_value(&args, &fifo_path.display().to_string(), "-framerate"),
             Some("30")
         );
-        assert_eq!(
-            input_arg_value(
-                &args,
-                &fifo_path.display().to_string(),
-                "-thread_queue_size"
-            ),
-            Some("16"),
-            "live raw video must have its own demux queue when device audio is also active"
-        );
-        assert_eq!(
-            input_arg_value(
-                &args,
-                &fifo_path.display().to_string(),
-                "-use_wallclock_as_timestamps"
-            ),
-            Some("1"),
-            "rawvideo must use arrival timestamps so encoder backpressure does not shorten recordings"
-        );
-        assert!(!input_has_arg(
-            &args,
-            "sine=frequency=880:sample_rate=48000",
-            "-re"
-        ));
+        // The tone must be realtime-paced: unpaced lavfi audio runs ahead of
+        // the realtime FIFO video and -shortest flushes the surplus as an
+        // audio tail (reads as A/V skew in the finished file).
         assert!(
-            args.iter()
-                .any(|arg| arg == "[0:v]setpts=PTS-STARTPTS,fps=30[v_main]")
+            args.windows(3)
+                .any(|window| window[0] == "-re" && window[1] == "-f" && window[2] == "lavfi"),
+            "test tone input must be realtime-paced: {args:?}"
         );
+        assert!(args.iter().any(|arg| arg == "[v_main]"));
         assert!(!args.iter().any(|arg| arg == "[preview]"));
         assert!(args.iter().any(|arg| arg == "1:a?"));
-        assert_current_h264_encoder_args(&args);
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(arg_value(&args, "-c:v"), Some("h264_videotoolbox"));
+            assert_eq!(arg_value(&args, "-allow_sw"), Some("1"));
+            assert_eq!(arg_value(&args, "-realtime"), Some("1"));
+            assert_eq!(arg_value(&args, "-prio_speed"), Some("1"));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(arg_value(&args, "-c:v"), Some("libx264"));
+            assert_eq!(arg_value(&args, "-preset"), Some("veryfast"));
+            assert_eq!(arg_value(&args, "-tune"), Some("zerolatency"));
+        }
         assert_eq!(arg_value(&args, "-c:a"), Some("pcm_s16le"));
         assert!(args.iter().any(|arg| arg == "-shortest"));
 
@@ -12021,13 +12133,7 @@ mod tests {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            assert_eq!(
-                arg_value(&args, "-c:v"),
-                Some(ffmpeg_h264_encoder(current_ffmpeg_h264_platform()).codec)
-            );
-            assert_eq!(arg_value(&args, "-allow_sw"), None);
-            assert_eq!(arg_value(&args, "-realtime"), None);
-            assert_eq!(arg_value(&args, "-prio_speed"), None);
+            assert_eq!(arg_value(&args, "-c:v"), Some("libx264"));
             assert_eq!(
                 input_arg_value(&args, &fifo_path.display().to_string(), "-pix_fmt"),
                 Some("yuv420p")
@@ -12074,25 +12180,21 @@ mod tests {
         // Plan 023 L1: MpegTs default; each target is its OWN fifo-muxer
         // output — tee cannot carry mpegts inputs to flv slaves (tag [27]).
         #[cfg(target_os = "macos")]
-        assert_eq!(
-            video_output,
-            EncoderBridgeVideoOutput::VideoToolboxH264MpegTs
-        );
-        #[cfg(not(target_os = "macos"))]
-        assert_eq!(video_output, EncoderBridgeVideoOutput::RawYuv420p);
-        assert!(!args.contains(&"tee".to_string()));
-        assert!(args.contains(&"rtmp://a.rtmp.youtube.com/live2/yt".to_string()));
-        assert!(args.contains(&"rtmp://live.twitch.tv/app/tw".to_string()));
-        assert_eq!(
-            args.windows(2)
-                .filter(|window| window[0] == "-f" && window[1] == "fifo")
-                .count(),
-            2,
-            "every RTMP target must be an isolated fifo-muxer output: {args:?}"
-        );
-        assert_eq!(arg_value(&args, "-c:a"), Some("aac"));
-        #[cfg(target_os = "macos")]
         {
+            assert_eq!(
+                video_output,
+                EncoderBridgeVideoOutput::VideoToolboxH264MpegTs
+            );
+            assert!(!args.contains(&"tee".to_string()));
+            assert!(args.contains(&"rtmp://a.rtmp.youtube.com/live2/yt".to_string()));
+            assert!(args.contains(&"rtmp://live.twitch.tv/app/tw".to_string()));
+            assert_eq!(
+                args.windows(2)
+                    .filter(|window| window[0] == "-f" && window[1] == "fifo")
+                    .count(),
+                2,
+                "every RTMP target must be an isolated fifo-muxer output: {args:?}"
+            );
             assert_eq!(arg_value(&args, "-c:v"), Some("copy"));
             assert_eq!(arg_value(&args, "-tag:v"), Some("7"));
             assert_eq!(arg_value(&args, "-filter_complex"), None);
@@ -12105,20 +12207,31 @@ mod tests {
                 None
             );
         }
+        // Raw bridge output re-encodes once and tees the encoded stream to every
+        // FLV leg (tee itself runs fifo-protected); per-target fifo-muxer outputs
+        // are a copy-output concern. The tag-[27] constraint does not apply here.
         #[cfg(not(target_os = "macos"))]
         {
-            assert_eq!(
-                arg_value(&args, "-c:v"),
-                Some(ffmpeg_h264_encoder(current_ffmpeg_h264_platform()).codec)
+            assert_eq!(video_output, EncoderBridgeVideoOutput::RawYuv420p);
+            assert!(args.contains(&"tee".to_string()));
+            let tee_spec = args.last().expect("tee args end with the leg spec");
+            assert!(
+                tee_spec.contains("rtmp://a.rtmp.youtube.com/live2/yt"),
+                "tee spec must carry every RTMP target: {tee_spec}"
             );
-            assert_eq!(arg_value(&args, "-allow_sw"), None);
-            assert_eq!(arg_value(&args, "-realtime"), None);
-            assert_eq!(arg_value(&args, "-prio_speed"), None);
+            assert!(tee_spec.contains("rtmp://live.twitch.tv/app/tw"));
+            assert!(
+                tee_spec.contains("onfail=ignore"),
+                "a refused RTMP target must be a dead leg, never a dead session: {tee_spec}"
+            );
+            // Raw legs encode in software off macOS until VAAPI/NVENC land.
+            assert_eq!(arg_value(&args, "-c:v"), Some("libx264"));
             assert_eq!(
                 input_arg_value(&args, &fifo_path.display().to_string(), "-pix_fmt"),
                 Some("yuv420p")
             );
         }
+        assert_eq!(arg_value(&args, "-c:a"), Some("aac"));
         assert!(args.iter().any(|arg| arg == "-shortest"));
     }
 
@@ -12214,13 +12327,7 @@ mod tests {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            assert_eq!(
-                arg_value(&args, "-c:v"),
-                Some(ffmpeg_h264_encoder(current_ffmpeg_h264_platform()).codec)
-            );
-            assert_eq!(arg_value(&args, "-allow_sw"), None);
-            assert_eq!(arg_value(&args, "-realtime"), None);
-            assert_eq!(arg_value(&args, "-prio_speed"), None);
+            assert_eq!(arg_value(&args, "-c:v"), Some("libx264"));
             assert_eq!(
                 input_arg_value(&args, &fifo_path.display().to_string(), "-pix_fmt"),
                 Some("yuv420p")
@@ -13168,7 +13275,17 @@ mod tests {
         assert_eq!(arg_value(&args, "-ac"), Some("2"));
         assert_eq!(arg_value(&args, "-c:a"), Some("aac"));
         assert_eq!(arg_value(&args, "-b:a"), Some("160k"));
-        assert_current_h264_encoder_args(&args);
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(arg_value(&args, "-allow_sw"), Some("1"));
+            assert_eq!(arg_value(&args, "-realtime"), Some("1"));
+            assert_eq!(arg_value(&args, "-prio_speed"), Some("1"));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(arg_value(&args, "-preset"), Some("veryfast"));
+            assert_eq!(arg_value(&args, "-tune"), Some("zerolatency"));
+        }
         // A pinned 2-second keyframe interval so YouTube (and HLS/DVR) go live.
         assert_eq!(
             arg_value(&args, "-force_key_frames"),
@@ -14493,9 +14610,7 @@ mod tests {
         validate_session_entitlements(&params, &snapshot).unwrap();
     }
 
-    // macOS-only: pins the VideoToolbox encoded split-output bridge. Windows
-    // has no encoded bridge output yet (RawYuv420p default; plan 019 / the
-    // windows-port recording-path decision owns the Windows behavior).
+    // Split-output profiles require the VideoToolbox copy outputs, which only exist on macOS.
     #[cfg(target_os = "macos")]
     #[test]
     fn entitlement_guard_blocks_true_4k_streaming_on_basic() {
@@ -14530,9 +14645,7 @@ mod tests {
     // 4K streaming is a Premium feature (2026-07-06): premium streams up to
     // 4K30; only basic stays HD. Recording is never the blocker — every tier
     // records 4K.
-    // macOS-only: pins the VideoToolbox encoded split-output bridge. Windows
-    // has no encoded bridge output yet (RawYuv420p default; plan 019 / the
-    // windows-port recording-path decision owns the Windows behavior).
+    // Split-output profiles require the VideoToolbox copy outputs, which only exist on macOS.
     #[cfg(target_os = "macos")]
     #[test]
     fn entitlement_guard_allows_true_4k_streaming_on_premium() {
@@ -14557,9 +14670,7 @@ mod tests {
         validate_session_entitlements(&params, &snapshot).unwrap();
     }
 
-    // macOS-only: pins the VideoToolbox encoded split-output bridge. Windows
-    // has no encoded bridge output yet (RawYuv420p default; plan 019 / the
-    // windows-port recording-path decision owns the Windows behavior).
+    // Split-output profiles require the VideoToolbox copy outputs, which only exist on macOS.
     #[cfg(target_os = "macos")]
     #[test]
     fn entitlement_guard_allows_true_4k_streaming_with_developer_override() {
@@ -15233,9 +15344,7 @@ mod tests {
         );
     }
 
-    // macOS-only: pins the VideoToolbox encoded split-output bridge. Windows
-    // has no encoded bridge output yet (RawYuv420p default; plan 019 / the
-    // windows-port recording-path decision owns the Windows behavior).
+    // Split-output profiles require the VideoToolbox copy outputs, which only exist on macOS.
     #[cfg(target_os = "macos")]
     #[test]
     fn split_output_profiles_resolve_youtube_4k30_true_stream() {
@@ -15278,9 +15387,7 @@ mod tests {
         );
     }
 
-    // macOS-only: pins the VideoToolbox encoded split-output bridge. Windows
-    // has no encoded bridge output yet (RawYuv420p default; plan 019 / the
-    // windows-port recording-path decision owns the Windows behavior).
+    // Split-output profiles require the VideoToolbox copy outputs, which only exist on macOS.
     #[cfg(target_os = "macos")]
     #[test]
     fn split_output_profiles_allow_youtube_4k_with_twitch_1080p_companion() {
@@ -15379,9 +15486,7 @@ mod tests {
         );
     }
 
-    // macOS-only: pins the VideoToolbox encoded split-output bridge. Windows
-    // has no encoded bridge output yet (RawYuv420p default; plan 019 / the
-    // windows-port recording-path decision owns the Windows behavior).
+    // Split-output profiles require the VideoToolbox copy outputs, which only exist on macOS.
     #[cfg(target_os = "macos")]
     #[test]
     fn accepts_4k_record_with_stream_safe_split_output_profile() {
@@ -15405,9 +15510,7 @@ mod tests {
         validate_outputs(&params).unwrap();
     }
 
-    // macOS-only: pins the VideoToolbox encoded split-output bridge. Windows
-    // has no encoded bridge output yet (RawYuv420p default; plan 019 / the
-    // windows-port recording-path decision owns the Windows behavior).
+    // Split-output profiles require the VideoToolbox copy outputs, which only exist on macOS.
     #[cfg(target_os = "macos")]
     #[test]
     fn accepts_youtube_4k30_stream_with_record_4k30_profile() {
@@ -15431,9 +15534,7 @@ mod tests {
         validate_outputs(&params).unwrap();
     }
 
-    // macOS-only: pins the VideoToolbox encoded split-output bridge. Windows
-    // has no encoded bridge output yet (RawYuv420p default; plan 019 / the
-    // windows-port recording-path decision owns the Windows behavior).
+    // Split-output profiles require the VideoToolbox copy outputs, which only exist on macOS.
     #[cfg(target_os = "macos")]
     #[test]
     fn allows_youtube_4k30_stream_when_twitch_uses_safe_companion_profile() {

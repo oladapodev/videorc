@@ -1542,7 +1542,15 @@ fn available_space(path: &Path) -> Option<u64> {
         return None;
     }
     let stats = unsafe { stats.assume_init() };
-    Some((stats.f_bavail as u64).saturating_mul(stats.f_frsize))
+    // statvfs field widths vary by Unix target (notably macOS versus Linux).
+    // Normalize both operands before multiplying so free-space checks preserve
+    // the full byte count without making the platform ABI part of this API.
+    #[cfg(target_os = "macos")]
+    let available_blocks = u64::from(stats.f_bavail);
+    #[cfg(not(target_os = "macos"))]
+    let available_blocks = stats.f_bavail;
+    let fragment_size = stats.f_frsize;
+    Some(available_blocks.saturating_mul(fragment_size))
 }
 
 #[cfg(target_os = "windows")]

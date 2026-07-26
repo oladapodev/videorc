@@ -545,7 +545,21 @@ pub(crate) fn capture_session_file_object_identity_from_file(
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
+        Ok(SessionFileObjectIdentity {
+            volume_id: metadata.dev(),
+            // Linux can recycle an inode immediately after unlink (notably on
+            // overlayfs). Mix the birth timestamp into the persisted identity
+            // so crash recovery cannot mistake a replacement for our file.
+            file_id: linux_file_object_id(file.as_raw_fd(), metadata.ino(), path)?,
+        })
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         use std::os::unix::fs::MetadataExt;
         Ok(SessionFileObjectIdentity {
@@ -570,6 +584,36 @@ pub(crate) fn capture_session_file_object_identity_from_file(
             path.display()
         )
     }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_file_object_id(fd: std::os::fd::RawFd, inode: u64, path: &Path) -> Result<u64> {
+    let mut statx = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    let empty_path = b"\0";
+    let result = unsafe {
+        libc::statx(
+            fd,
+            empty_path.as_ptr().cast(),
+            libc::AT_EMPTY_PATH | libc::AT_STATX_SYNC_AS_STAT,
+            libc::STATX_INO | libc::STATX_BTIME,
+            statx.as_mut_ptr(),
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "Could not inspect Linux object identity for {}",
+                path.display()
+            )
+        });
+    }
+    let statx = unsafe { statx.assume_init() };
+    if statx.stx_mask & libc::STATX_BTIME == 0 {
+        return Ok(inode);
+    }
+    let birth_seconds = u64::from_ne_bytes(statx.stx_btime.tv_sec.to_ne_bytes());
+    let birth_nanos = u64::from(statx.stx_btime.tv_nsec);
+    Ok(inode ^ birth_seconds.rotate_left(21) ^ birth_nanos.rotate_left(42))
 }
 
 #[cfg(target_os = "windows")]
@@ -691,7 +735,36 @@ pub(crate) fn session_media_path_state(path: &Path) -> SessionMediaPathState {
 pub(crate) fn capture_session_directory_object_identity(
     path: &Path,
 ) -> Result<Option<SessionFileObjectIdentity>> {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = match File::open(path) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Could not open session directory {}", path.display())
+                });
+            }
+        };
+        let metadata = directory
+            .metadata()
+            .with_context(|| format!("Could not inspect session directory {}", path.display()))?;
+        if !metadata.is_dir() {
+            bail!(
+                "Session staging directory {} is not a directory.",
+                path.display()
+            );
+        }
+        Ok(Some(SessionFileObjectIdentity {
+            volume_id: metadata.dev(),
+            file_id: linux_file_object_id(directory.as_raw_fd(), metadata.ino(), path)?,
+        }))
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         use std::os::unix::fs::MetadataExt;
 
@@ -3822,6 +3895,35 @@ impl Database {
         Ok(())
     }
 
+    /// The portal ScreenCast restore token (Linux): stored so a granted
+    /// screen selection restores without re-prompting the compositor picker
+    /// on every launch. Keyed per portal source id so a window and a monitor
+    /// grant do not clobber each other.
+    pub fn screencast_restore_token(&self, source_id: &str) -> Result<Option<String>> {
+        let conn = self.lock()?;
+        let value_json = conn
+            .query_row(
+                "SELECT value_json FROM app_settings WHERE key = ?1",
+                params![screencast_restore_token_key(source_id)],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(value_json.and_then(|value| serde_json::from_str::<String>(&value).ok()))
+    }
+
+    pub fn save_screencast_restore_token(&self, source_id: &str, token: &str) -> Result<()> {
+        self.save_setting(&screencast_restore_token_key(source_id), &token)
+    }
+
+    pub fn clear_screencast_restore_token(&self, source_id: &str) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "DELETE FROM app_settings WHERE key = ?1",
+            params![screencast_restore_token_key(source_id)],
+        )?;
+        Ok(())
+    }
+
     pub fn import_screen_image(&self, image_path: &str, ffmpeg_path: &str) -> Result<StreamScreen> {
         self.import_screen_image_with_optimizer(image_path, |source, destination| {
             optimize_screen_image(source, destination, ffmpeg_path)
@@ -5371,6 +5473,10 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str)
 }
 
 #[allow(dead_code)]
+fn screencast_restore_token_key(source_id: &str) -> String {
+    format!("screencastRestoreToken:{source_id}")
+}
+
 fn normalized_scopes(scopes: Vec<String>) -> Vec<String> {
     let mut scopes = scopes
         .into_iter()
@@ -5923,12 +6029,23 @@ mod tests {
         assert_eq!(database.reconcile_orphaned_sessions().unwrap(), 0);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn default_database_path_uses_application_support_on_macos() {
         let path = default_database_path();
         let rendered = path.display().to_string();
 
         assert!(rendered.contains("Videorc"));
+        assert!(rendered.ends_with("videorc.sqlite3"));
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn default_database_path_uses_dot_videorc_elsewhere() {
+        let path = default_database_path();
+        let rendered = path.display().to_string();
+
+        assert!(rendered.contains(".videorc"));
         assert!(rendered.ends_with("videorc.sqlite3"));
     }
 

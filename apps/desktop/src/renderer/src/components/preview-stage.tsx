@@ -1,5 +1,5 @@
 import { ArrowSquareOut, PushPinSimple, VideoCamera, Warning } from '@phosphor-icons/react'
-import type { ReactElement, ReactNode } from 'react'
+import { useEffect, useState, type ReactElement } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
@@ -13,6 +13,9 @@ import type {
   PreviewWindowState
 } from '@/lib/backend'
 import { cn } from '@/lib/utils'
+
+/** ~15fps matches the backend JPEG bridge cadence. */
+const SOFTWARE_PREVIEW_POLL_MS = 66
 
 type PreviewStageProps = {
   previewLiveStatus?: PreviewLiveStatus
@@ -42,6 +45,8 @@ export function PreviewStage({
     closePreviewWindow,
     setPreviewWindowAlwaysOnTop,
     setPreviewWindowMode,
+    softwarePreview,
+    softwarePreviewUrl,
     captureConfig
   } = useStudioCore()
 
@@ -50,6 +55,19 @@ export function PreviewStage({
   // The reporter is active exactly while the docked frame is on screen; its
   // cleanup tells main the slot unmounted (tab switch, undock, close).
   const slotRef = useDockSlotReporter(docked, previewWindow.dockEpoch)
+
+  // Software preview (Linux and any non-Metal platform): poll the compositor's
+  // latest JPEG frame inline — there is no separate window and no native
+  // surface to host. (After all hooks so hook order stays stable.)
+  if (softwarePreview) {
+    return (
+      <SoftwarePreviewCard
+        aspect={{ width: captureConfig.video.width, height: captureConfig.video.height }}
+        className={className}
+        frameUrl={softwarePreviewUrl}
+      />
+    )
+  }
 
   if (docked) {
     return (
@@ -113,6 +131,90 @@ function previewFootprintRatio(aspect: { width: number; height: number }): strin
  * 0.9.32 vertical-mode report). */
 function previewSlotRatio(aspect: { width: number; height: number }): string {
   return aspect.width > 0 && aspect.height > 0 ? `${aspect.width} / ${aspect.height}` : '16 / 9'
+}
+
+// Inline software preview: poll /preview/live.jpg (single-frame JPEG the
+// compositor bridge refreshes). A static <img src> would cache one frame;
+// cache-busting the query keeps the panel live. Used where there is no macOS
+// Metal surface (Linux etc.).
+function SoftwarePreviewCard({
+  frameUrl,
+  aspect,
+  className
+}: {
+  frameUrl: string | null
+  aspect: { width: number; height: number }
+  className?: string
+}): ReactElement {
+  const [displayUrl, setDisplayUrl] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!frameUrl) {
+      setDisplayUrl(null)
+      return
+    }
+
+    let cancelled = false
+    let timer: number | undefined
+
+    const poll = () => {
+      if (cancelled) {
+        return
+      }
+      const next = `${frameUrl}${frameUrl.includes('?') ? '&' : '?'}t=${Date.now()}`
+      const probe = new Image()
+      probe.onload = () => {
+        if (!cancelled) {
+          setDisplayUrl(next)
+        }
+        timer = window.setTimeout(poll, SOFTWARE_PREVIEW_POLL_MS)
+      }
+      probe.onerror = () => {
+        timer = window.setTimeout(poll, SOFTWARE_PREVIEW_POLL_MS)
+      }
+      probe.src = next
+    }
+
+    poll()
+    return () => {
+      cancelled = true
+      if (timer !== undefined) {
+        window.clearTimeout(timer)
+      }
+    }
+  }, [frameUrl])
+
+  return (
+    <div
+      className={cn('flex w-full flex-col overflow-hidden rounded-panel border', className)}
+      data-videorc-preview-card
+      data-videorc-preview-software
+    >
+      <div
+        className="relative w-full bg-[#0D0D0F]"
+        style={{ aspectRatio: previewAspectRatio(aspect) }}
+      >
+        {displayUrl ? (
+          <img
+            alt="Live program preview"
+            className="absolute inset-0 size-full object-contain"
+            src={displayUrl}
+          />
+        ) : (
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-6 text-center">
+            <VideoCamera className="size-8 text-muted-foreground" weight="duotone" />
+            <span className="text-sm font-medium text-[#F4F4F5]">Waiting for preview</span>
+            <span className="text-xs text-[#A1A1AA]">
+              Connecting to the compositor preview stream…
+            </span>
+          </div>
+        )}
+      </div>
+      <div className="flex items-center justify-between gap-2 border-t px-3 py-1.5">
+        <span className="text-xs text-muted-foreground">Software preview (this OS)</span>
+      </div>
+    </div>
+  )
 }
 
 // Docked ("stick") mode: the native preview surface floats glued over the slot

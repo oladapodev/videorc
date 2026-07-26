@@ -1123,6 +1123,62 @@ export interface OutputSettings {
   rtmp: RtmpSettings
 }
 
+export type MediaPolicyPreset =
+  | 'automatic'
+  | 'performance'
+  | 'balanced'
+  | 'quality'
+  | 'compatibility'
+  | 'custom'
+export type MediaCaptureBackendId =
+  | 'pipewire-portal'
+  | 'electron-portal'
+  | 'ffmpeg-x11'
+  | 'test-pattern'
+export type MediaAudioBackendId = 'pipewire' | 'pulse-compat' | 'alsa-compat' | 'test-tone'
+export type MediaCompositorBackendId = 'automatic' | 'cpu' | 'wgpu' | 'ffmpeg-compat'
+export type MediaPreviewBackendId = 'automatic' | 'native-wgpu' | 'electron-webgl' | 'mjpeg-debug'
+export type MediaEncoderBackendId =
+  | 'h264-vaapi'
+  | 'h264-qsv'
+  | 'libx264'
+  | 'libopenh264'
+  | 'automatic'
+export type MediaPolicyFallbackMode =
+  | 'safe-auto'
+  | 'ask-first'
+  | 'strict'
+  | 'hardware-only'
+  | 'software-only'
+export type MediaPolicyCapabilityVerdict = 'supported' | 'degraded' | 'unavailable' | 'unknown'
+export type MediaPolicyBenchmarkRecommendation = 'performance' | 'balanced' | 'quality'
+
+export interface MediaBackendPolicyContract {
+  capture: MediaCaptureBackendId
+  audio: MediaAudioBackendId
+  compositor: MediaCompositorBackendId
+  preview: MediaPreviewBackendId
+  recordingEncoder: MediaEncoderBackendId
+  streamingEncoder: MediaEncoderBackendId
+  benchmarkRecommendation?: MediaPolicyBenchmarkRecommendation
+}
+
+export interface MediaPolicyRequest {
+  intent: MediaPolicyPreset
+  requested: MediaBackendPolicyContract
+}
+
+export interface MediaPolicySelection {
+  requested: MediaPolicyRequest
+  selected: MediaBackendPolicyContract
+  fallbackMode: MediaPolicyFallbackMode
+  fallbackReason?: string
+  capabilityVerdict: MediaPolicyCapabilityVerdict
+  observedRuntimePath?: string
+  hardwareFingerprint?: string
+  benchmarkRecommendation?: MediaPolicyBenchmarkRecommendation
+}
+
 export interface StartSessionParams {
   sources: SourceSelection
   layout: LayoutSettings
@@ -1131,6 +1187,7 @@ export interface StartSessionParams {
   audio?: AudioSettings
   streaming?: StreamingSettings
   captions?: CaptionsSessionParams
+  mediaPolicy?: MediaPolicySelection
 }
 
 /** Burn-in intent for the session (shapes output legs; see burn-in plan A0/R1)
@@ -2474,14 +2531,9 @@ export interface ReorderScreensParams {
 export interface RuntimeInfo {
   /** The running app version (`app.getVersion()`), shown in Settings → About. */
   version: string
+  /** `process.platform` — lets the renderer branch on OS (e.g. Linux uses the
+   * software JPEG preview instead of the macOS native Metal surface). */
   platform: string
-  arch: string
-  osRelease: string
-  gpuDevices: RuntimeGpuDevice[]
-  /** True when Videorc is running with hardware acceleration disabled — via
-   * VIDEORC_DISABLE_GPU=1 or the persisted GPU-crash fallback. Surfaced so
-   * support bundles name the active graphics mode. */
-  hardwareAccelerationDisabled: boolean
   isPackaged: boolean
   permissionTargetName: string
   permissionTargetPath: string

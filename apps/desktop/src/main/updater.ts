@@ -1,7 +1,7 @@
 import { app, Notification } from 'electron'
 import type { BrowserWindow } from 'electron'
 import electronUpdater from 'electron-updater'
-import type { ProgressInfo, UpdateInfo } from 'electron-updater'
+import type { AppUpdater, ProgressInfo, UpdateInfo } from 'electron-updater'
 
 import type { UpdateStatus } from '../shared/backend'
 import type { AcquireBackendInterruption } from './interruption-actions'
@@ -16,7 +16,12 @@ import {
   updateStatusFromEvent
 } from './updater-status'
 
-const { autoUpdater } = electronUpdater
+// Lazy: electron-updater's AppImageUpdater reads app.getVersion() at construct
+// time. Accessing autoUpdater at module load (before app is ready) crashes on
+// Linux. Resolve it only from init/IPC paths that run after Electron is up.
+function getAutoUpdater(): AppUpdater {
+  return electronUpdater.autoUpdater
+}
 
 // One shared electron-updater singleton drives two flows:
 //   • a silent background check on every launch (default for packaged builds;
@@ -67,6 +72,8 @@ function attachUpdaterListeners(): void {
     return
   }
   listenersAttached = true
+
+  const autoUpdater = getAutoUpdater()
 
   // Manual + background both drive download explicitly.
   autoUpdater.autoDownload = false
@@ -121,6 +128,7 @@ export function initAutoUpdater(): void {
   }
 
   attachUpdaterListeners()
+  const autoUpdater = getAutoUpdater()
 
   // autoDownload is off, so kick the download ourselves when an update is found.
   autoUpdater.on('update-available', () => {
@@ -171,6 +179,7 @@ export function registerUpdaterIpc(
       setStatus(updateStatusFromEvent({ type: 'unsupported' }))
       return currentStatus
     }
+    const autoUpdater = getAutoUpdater()
     try {
       setStatus(updateStatusFromEvent({ type: 'checking' }))
       await autoUpdater.checkForUpdates()
@@ -197,7 +206,7 @@ export function registerUpdaterIpc(
       return currentStatus
     }
     try {
-      await autoUpdater.downloadUpdate()
+      await getAutoUpdater().downloadUpdate()
       return currentStatus
     } catch (error) {
       const message = errorMessage(error)
@@ -212,20 +221,6 @@ export function registerUpdaterIpc(
     if (!app.isPackaged) {
       return
     }
-    try {
-      const admission = await installUpdateWithInterruptionLease(
-        captureInstallBlocked,
-        () => acquireInterruption('Installing a downloaded Videorc update.', 'update-install'),
-        () => autoUpdater.quitAndInstall()
-      )
-      if (admission !== 'installing') {
-        safeConsole.warn(
-          '[auto-update] install deferred because capture is active, starting, or unconfirmed.'
-        )
-      }
-    } catch (error) {
-      // Admission transport failures are fail-closed: never quit on a guess.
-      safeConsole.warn(`[auto-update] install admission failed: ${errorMessage(error)}`)
-    }
+    getAutoUpdater().quitAndInstall()
   })
 }

@@ -1,4 +1,6 @@
-use std::collections::{HashMap, HashSet};
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,6 +12,9 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, MissedTickBehavior, sleep};
 use uuid::Uuid;
+
+#[cfg(target_os = "linux")]
+use rayon::prelude::*;
 
 use crate::color::rgb_to_yuv_full_range_bt601 as rgb_to_yuv;
 use crate::compositor_synthetic::SyntheticMovingSource;
@@ -198,35 +203,10 @@ pub struct CompositorRuntime {
     run_id: Option<String>,
     stop_tx: Option<watch::Sender<bool>>,
     render_task: Option<JoinHandle<()>>,
-    worker_activity: Arc<CompositorWorkerActivity>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompositorFrameConsumer {
-    NativePreview,
-    VideoToolboxEncoder,
-    RawYuvEncoder,
-    #[allow(dead_code)] // Reserved for the explicit JPEG debug/fallback attachment path.
-    JpegFallback,
-}
-
-impl CompositorFrameConsumer {
-    const fn publishes_cpu_yuv(self) -> bool {
-        matches!(self, Self::RawYuvEncoder | Self::JpegFallback)
-    }
-
-    const fn requires_cpu_fallback(self) -> bool {
-        !matches!(self, Self::NativePreview)
-    }
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::NativePreview => "native-preview",
-            Self::VideoToolboxEncoder => "videotoolbox-encoder",
-            Self::RawYuvEncoder => "raw-yuv-encoder",
-            Self::JpegFallback => "jpeg-fallback",
-        }
-    }
+    /// Linux software-preview bridge: encodes composited frames to JPEG for the
+    /// `/preview/live.jpg` poller (there is no Metal surface to present). Always
+    /// `None` on macOS, where the native surface presents the compositor output.
+    preview_task: Option<JoinHandle<()>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -827,7 +807,7 @@ pub fn initial_compositor_state() -> CompositorRuntime {
         run_id: None,
         stop_tx: None,
         render_task: None,
-        worker_activity: Arc::new(CompositorWorkerActivity::default()),
+        preview_task: None,
     }
 }
 
@@ -896,27 +876,49 @@ pub async fn start_synthetic_compositor(
         compositor.latest_frame_evidence = None;
         compositor.status = status.clone();
         compositor.run_id = Some(run_id.clone());
+        // Linux software preview reads the compositor frame store; take a stop
+        // subscription before the sender moves into the runtime.
+        #[cfg(target_os = "linux")]
+        let preview_stop_rx = stop_tx.subscribe();
         compositor.stop_tx = Some(stop_tx);
-        // Spawn and publish the worker handle while holding the ownership lock. A concurrent
-        // replacement can therefore never observe a live run id without the handle it must
-        // await, avoiding the ineffective `abort` race of `spawn_blocking` workers.
-        compositor.render_task = Some(spawn_compositor_render_loop(
-            state.clone(),
-            CompositorRenderLoopParams {
-                run_id: run_id.clone(),
-                target_fps,
-                width: status.width,
-                height: status.height,
-                frame_consumer: params.frame_consumer,
-                stream_output: params.stream_output,
-                caption_overlay_on_primary: params.caption_overlay_on_primary,
-                caption_overlay_on_aux: params.caption_overlay_on_aux,
-                highlight_overlay_on_primary: params.highlight_overlay_on_primary,
-                highlight_overlay_on_aux: params.highlight_overlay_on_aux,
-            },
-            stop_rx,
-            previous_scene_status.6,
-        ));
+        compositor.render_task = None;
+        if let Some(previous) = compositor.preview_task.take() {
+            previous.abort();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            compositor.preview_task = Some(spawn_preview_jpeg_bridge(
+                state.clone(),
+                run_id.clone(),
+                preview_stop_rx,
+            ));
+        }
+    }
+
+    let render_task = spawn_compositor_render_loop(
+        state.clone(),
+        CompositorRenderLoopParams {
+            run_id: run_id.clone(),
+            target_fps,
+            width: status.width,
+            height: status.height,
+            publish_yuv_frames: params.publish_yuv_frames,
+            stream_output: params.stream_output,
+            caption_overlay_on_primary: params.caption_overlay_on_primary,
+            caption_overlay_on_aux: params.caption_overlay_on_aux,
+            highlight_overlay_on_primary: params.highlight_overlay_on_primary,
+            highlight_overlay_on_aux: params.highlight_overlay_on_aux,
+        },
+        stop_rx,
+    );
+
+    {
+        let mut compositor = state.compositor.lock().await;
+        if compositor.run_id.as_deref() == Some(run_id.as_str()) {
+            compositor.render_task = Some(render_task);
+        } else {
+            render_task.abort();
+        }
     }
 
     state.emit_event("compositor.status", status.clone());
@@ -978,7 +980,16 @@ pub async fn stop_compositor_if_run_id(state: &AppState, run_id: &str) -> Option
         if let Some(stop_tx) = compositor.stop_tx.take() {
             let _ = stop_tx.send(true);
         }
-        compositor.render_task.take()
+        compositor.run_id = None;
+        let previous_task = compositor.render_task.take();
+        if let Some(preview_task) = compositor.preview_task.take() {
+            preview_task.abort();
+        }
+        compositor.latest_frame_evidence = None;
+        compositor.stream_frame_store = None;
+        let status = stopped_status(Some("Compositor stopped.".to_string()));
+        compositor.status = status.clone();
+        (previous_task, status)
     };
 
     if !await_compositor_task(state, run_id, previous_task).await {
@@ -998,6 +1009,136 @@ pub async fn stop_compositor_if_run_id(state: &AppState, run_id: &str) -> Option
     };
     state.emit_event("compositor.status", status.clone());
     Some(status)
+}
+
+/// Linux software preview: there is no Metal surface to present, so this task
+/// reads the CPU compositor's latest composited frame at ~15fps, encodes it to
+/// JPEG, and publishes it to `preview_latest_frame` — which the existing
+/// `/preview/live.jpg` endpoint serves and the Studio's preview panel renders
+/// inline. Stops when the compositor stops (the shared watch signal) or the
+/// run id changes.
+#[cfg(target_os = "linux")]
+fn spawn_preview_jpeg_bridge(
+    state: AppState,
+    run_id: String,
+    mut stop_rx: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    // ~15fps is plenty for a monitoring preview and keeps the JPEG encode off
+    // the compositor's frame budget entirely.
+    const PREVIEW_INTERVAL: Duration = Duration::from_millis(66);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(PREVIEW_INTERVAL);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut last_sequence = 0_u64;
+        loop {
+            tokio::select! {
+                changed = stop_rx.changed() => {
+                    if changed.is_err() || *stop_rx.borrow() {
+                        break;
+                    }
+                }
+                _ = ticker.tick() => {}
+            }
+
+            let frame = {
+                let compositor = state.compositor.lock().await;
+                if compositor.run_id.as_deref() != Some(run_id.as_str()) {
+                    break;
+                }
+                compositor
+                    .frame_store
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .latest()
+            };
+            let Some(frame) = frame else { continue };
+            if frame.sequence == last_sequence {
+                continue;
+            }
+            last_sequence = frame.sequence;
+
+            let jpeg = tokio::task::spawn_blocking(move || {
+                compositor_yuv420p_to_jpeg(&frame.bytes, frame.width, frame.height)
+            })
+            .await;
+            let Ok(Some(jpeg)) = jpeg else { continue };
+
+            let sequence = {
+                let mut metrics = state.preview_metrics.lock().await;
+                metrics.next_sequence = metrics.next_sequence.saturating_add(1);
+                metrics.next_sequence
+            };
+            *state.preview_latest_frame.write().await = Some(crate::state::PreviewFrame {
+                sequence,
+                bytes: jpeg,
+                published_at: Instant::now(),
+            });
+        }
+    })
+}
+
+/// I420 (planar YUV 4:2:0, full-range BT.601 — what the CPU compositor writes)
+/// to a JPEG. Downscales the long edge to at most `PREVIEW_MAX_EDGE` so the
+/// encode stays cheap regardless of output resolution. Returns `None` on a
+/// malformed/short buffer rather than encoding garbage.
+#[cfg(target_os = "linux")]
+fn compositor_yuv420p_to_jpeg(bytes: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+    use crate::color::ycbcr_full_range_bt601_to_rgb;
+    use image::{ImageEncoder, codecs::jpeg::JpegEncoder, imageops::FilterType};
+
+    let width = width as usize;
+    let height = height as usize;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let uv_width = width.div_ceil(2);
+    let uv_height = height.div_ceil(2);
+    let y_len = width * height;
+    let uv_len = uv_width * uv_height;
+    if bytes.len() < y_len + uv_len * 2 {
+        return None;
+    }
+    let (y_plane, rest) = bytes.split_at(y_len);
+    let (u_plane, v_plane) = rest.split_at(uv_len);
+
+    let mut rgb = vec![0_u8; width * height * 3];
+    rgb.par_chunks_mut(width * 3)
+        .enumerate()
+        .for_each(|(row, rgb_row)| {
+            let uv_row = row / 2;
+            for (col, pixel) in rgb_row.chunks_exact_mut(3).enumerate() {
+                let uv_index = uv_row * uv_width + (col / 2);
+                let (r, g, b) = ycbcr_full_range_bt601_to_rgb(
+                    y_plane[row * width + col],
+                    u_plane[uv_index],
+                    v_plane[uv_index],
+                );
+                pixel[0] = r;
+                pixel[1] = g;
+                pixel[2] = b;
+            }
+        });
+
+    let mut image = image::RgbImage::from_raw(width as u32, height as u32, rgb)?;
+    const PREVIEW_MAX_EDGE: u32 = 1280;
+    let long_edge = width.max(height) as u32;
+    if long_edge > PREVIEW_MAX_EDGE {
+        let scale = f64::from(PREVIEW_MAX_EDGE) / f64::from(long_edge);
+        let target_w = ((width as f64 * scale).round() as u32).max(1);
+        let target_h = ((height as f64 * scale).round() as u32).max(1);
+        image = image::imageops::resize(&image, target_w, target_h, FilterType::Triangle);
+    }
+
+    let mut jpeg = Vec::new();
+    JpegEncoder::new_with_quality(&mut jpeg, 80)
+        .write_image(
+            image.as_raw(),
+            image.width(),
+            image.height(),
+            image::ExtendedColorType::Rgb8,
+        )
+        .ok()?;
+    Some(jpeg)
 }
 
 fn spawn_compositor_render_loop(
@@ -1493,7 +1634,11 @@ async fn stop_current_compositor(state: &AppState) -> bool {
         if let Some(stop_tx) = compositor.stop_tx.take() {
             let _ = stop_tx.send(true);
         }
-        (compositor.run_id.clone(), compositor.render_task.take())
+        compositor.run_id = None;
+        if let Some(preview_task) = compositor.preview_task.take() {
+            preview_task.abort();
+        }
+        compositor.render_task.take()
     };
 
     let previous_run_id = previous_run_id.as_deref().unwrap_or("unknown-run");
@@ -1633,6 +1778,18 @@ async fn run_synthetic_compositor_loop(
             }
             _ = ticker.tick() => {
                 let ticked_at = Instant::now();
+                // The preview surface can change orientation without restarting the
+                // compositor. Read the authoritative dimensions for this run on each
+                // tick so published frames follow that live resize instead of keeping
+                // the render loop's spawn-time dimensions.
+                let (frame_width, frame_height) = {
+                    let compositor = state.compositor.lock().await;
+                    if compositor.run_id.as_deref() == Some(run_id.as_str()) {
+                        (compositor.status.width, compositor.status.height)
+                    } else {
+                        (width, height)
+                    }
+                };
                 if let Some(previous_tick_at) = previous_tick_at {
                     let tick_gap_ms =
                         ticked_at.duration_since(previous_tick_at).as_secs_f64() * 1000.0;
@@ -1661,8 +1818,8 @@ async fn run_synthetic_compositor_loop(
                         &state,
                         &run_id,
                         frames_rendered,
-                        width,
-                        height,
+                        frame_width,
+                        frame_height,
                         &mut live_sources,
                         &mut render_cache,
                         gpu_compositor.as_mut(),
@@ -2105,21 +2262,7 @@ struct PreparedGpuSource<'a> {
     dest: [f32; 4],
     crop: [f32; 4],
     mirror: bool,
-    mask: SceneMask,
-    /// Straight-alpha source-over blend (overlay bitmaps only — capture sources
-    /// must keep the opaque overwrite; see `GpuSource::blend`).
-    blend: bool,
-}
-
-#[cfg(target_os = "macos")]
-fn scene_mask_into_metal(mask: SceneMask) -> crate::metal_compositor::SourceMask {
-    match mask {
-        SceneMask::None => crate::metal_compositor::SourceMask::None,
-        SceneMask::Circle => crate::metal_compositor::SourceMask::Circle,
-        SceneMask::Rounded { radius_pct } => {
-            crate::metal_compositor::SourceMask::Rounded { radius_pct }
-        }
-    }
+    mask: SourceMask,
 }
 
 #[cfg(target_os = "macos")]
@@ -2206,6 +2349,7 @@ fn scene_source_kind_label(kind: &SceneSourceKind) -> &'static str {
     }
 }
 
+#[cfg(target_os = "macos")]
 /// Append the caption bar as the TOPMOST Metal image source. The bridge
 /// consumes Metal-composited surfaces directly, so the overlay must ride the
 /// GPU path (forcing CPU starves the VideoToolbox encoder — exit 187).
@@ -2278,10 +2422,7 @@ fn push_caption_overlay_gpu_source<'a>(
         dest,
         crop,
         mirror: false,
-        mask: SceneMask::None,
-        // The bar/card is rasterized on a transparent canvas; without blending
-        // its alpha-0 pixels overwrite the frame as an opaque black box.
-        blend: true,
+        mask: SourceMask::None,
     });
 }
 
@@ -2349,8 +2490,7 @@ fn try_gpu_compose(
                     dest,
                     crop,
                     mirror: false,
-                    mask: SceneMask::None,
-                    blend: false,
+                    mask: SourceMask::None,
                 });
                 true
             } else {
@@ -2407,8 +2547,7 @@ fn try_gpu_compose(
             dest,
             crop,
             mirror: false,
-            mask: SceneMask::None,
-            blend: false,
+            mask: SourceMask::None,
         });
         if let Some(overlay) = inputs.caption_overlay {
             let safe_inset = caption_overlay_safe_inset(
@@ -2477,8 +2616,7 @@ fn try_gpu_compose(
             dest,
             crop,
             mirror: false,
-            mask: SceneMask::None,
-            blend: false,
+            mask: SourceMask::None,
         });
         if let Some(overlay) = inputs.caption_overlay {
             let safe_inset = caption_overlay_safe_inset(
@@ -2636,8 +2774,7 @@ fn try_gpu_compose(
                         dest,
                         crop,
                         mirror: false,
-                        mask: SceneMask::None,
-                        blend: false,
+                        mask: SourceMask::None,
                     });
                 } else {
                     let placeholder =
@@ -2663,8 +2800,7 @@ fn try_gpu_compose(
                         dest,
                         crop,
                         mirror: false,
-                        mask: SceneMask::None,
-                        blend: false,
+                        mask: SourceMask::None,
                     });
                 }
             }
@@ -2691,8 +2827,7 @@ fn try_gpu_compose(
                     dest,
                     crop,
                     mirror: false,
-                    mask: SceneMask::None,
-                    blend: false,
+                    mask: SourceMask::None,
                 });
             }
         }
@@ -3437,7 +3572,7 @@ fn render_compositor_yuv420p_scene(inputs: CompositorRenderInputs<'_>, bytes: &m
                     CompositorSceneSourceFit::Contain
                 ),
                 mirror_x: false,
-                mask: SceneMask::None,
+                mask: SourceMask::None,
             },
         )
     {
@@ -3481,7 +3616,7 @@ fn render_compositor_yuv420p_scene(inputs: CompositorRenderInputs<'_>, bytes: &m
                             crop: scene_crop_from_transform(&transform),
                             contain: screen_contain,
                             mirror_x: false,
-                            mask: SceneMask::None,
+                            mask: SourceMask::None,
                         },
                     )
                 } else if let Some(frame) = screen_frame {
@@ -3500,7 +3635,7 @@ fn render_compositor_yuv420p_scene(inputs: CompositorRenderInputs<'_>, bytes: &m
                             crop: scene_crop_from_transform(&transform),
                             contain: screen_contain,
                             mirror_x: false,
-                            mask: SceneMask::None,
+                            mask: SourceMask::None,
                         },
                     )
                 } else {
@@ -3730,12 +3865,59 @@ enum SourcePixelFormat {
     Rgba,
 }
 
+/// Camera-bubble mask shared by both software compositors (the FFmpeg leg mirrors
+/// the same constants in its filter graph). Lives here rather than in the Metal
+/// module so the CPU compositor builds on every platform; the Metal shader
+/// packing helpers stay in `metal_compositor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceMask {
+    None,
+    Circle,
+    Rounded { radius_pct: u32 },
+}
+
 #[derive(Debug, Clone, Copy)]
 struct SourceRenderOptions {
     crop: SceneCrop,
     contain: bool,
     mirror_x: bool,
-    mask: SceneMask,
+    mask: SourceMask,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SourceCrop {
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+}
+
+impl SourceCrop {
+    fn none() -> Self {
+        Self {
+            left: 0.0,
+            top: 0.0,
+            right: 0.0,
+            bottom: 0.0,
+        }
+    }
+
+    fn kept_width(self) -> f64 {
+        (1.0 - self.left - self.right).max(0.001)
+    }
+
+    fn kept_height(self) -> f64 {
+        (1.0 - self.top - self.bottom).max(0.001)
+    }
+}
+
+fn source_crop_from_transform(transform: &SceneTransform) -> SourceCrop {
+    SourceCrop {
+        left: transform.crop_left.clamp(0.0, 0.95),
+        top: transform.crop_top.clamp(0.0, 0.95),
+        right: transform.crop_right.clamp(0.0, 0.95),
+        bottom: transform.crop_bottom.clamp(0.0, 0.95),
+    }
 }
 
 struct RgbaSource<'a> {
@@ -3793,7 +3975,7 @@ fn render_scene_background(
             crop: background_zoom_crop(Some(background)),
             contain: matches!(background.fit, BackgroundFit::Fit),
             mirror_x: false,
-            mask: SceneMask::None,
+            mask: SourceMask::None,
         },
     )
 }
@@ -3903,7 +4085,7 @@ fn render_synthetic_source_rect(
             crop: SceneCrop::none(),
             contain: false,
             mirror_x: false,
-            mask: SceneMask::None,
+            mask: SourceMask::None,
         },
     );
 }
@@ -4258,18 +4440,47 @@ fn map_source_pixel(
     Some((source_x, source_y))
 }
 
-fn source_mask_allows(mask: SceneMask, dest_x: usize, dest_y: usize, fit: &SourceFit) -> bool {
-    scene_mask_allows(
-        mask,
-        PixelRect {
-            x: fit.x,
-            y: fit.y,
-            width: fit.width,
-            height: fit.height,
-        },
-        dest_x,
-        dest_y,
-    )
+/// Whether `(dest_x, dest_y)` falls inside the largest circle inscribed in `fit`'s box
+/// — diameter `min(width, height)`, centered. A circle bubble must stay round even when
+/// the box is not perfectly square (the preview drawable's aspect drifts from the output's,
+/// so the "square" camera box renders slightly non-square). Using separate x/y radii here
+/// drew an ellipse; this matches the recording path's `circle_alpha_mask_filter` so the
+/// preview and the encoded file agree.
+fn source_mask_allows(mask: SourceMask, dest_x: usize, dest_y: usize, fit: &SourceFit) -> bool {
+    match mask {
+        SourceMask::None => true,
+        SourceMask::Circle => inside_circle(dest_x, dest_y, fit),
+        SourceMask::Rounded { radius_pct } => inside_rounded_rect(dest_x, dest_y, fit, radius_pct),
+    }
+}
+
+/// Whether `(dest_x, dest_y)` falls inside `fit`'s box with its corners clipped at
+/// `radius_pct`% of the shorter side — the same SDF the Metal shader and the FFmpeg
+/// rounded_alpha_mask_filter use, so preview and recording agree.
+fn inside_rounded_rect(dest_x: usize, dest_y: usize, fit: &SourceFit, radius_pct: u32) -> bool {
+    let radius = f64::from(fit.width.min(fit.height)) * f64::from(radius_pct.min(50)) / 100.0;
+    if radius <= 0.0 {
+        return true;
+    }
+    let center_x = f64::from(fit.x) + f64::from(fit.width) / 2.0;
+    let center_y = f64::from(fit.y) + f64::from(fit.height) / 2.0;
+    let inner_half_w = (f64::from(fit.width) / 2.0 - radius).max(0.0);
+    let inner_half_h = (f64::from(fit.height) / 2.0 - radius).max(0.0);
+    let qx = ((dest_x as f64 + 0.5 - center_x).abs() - inner_half_w).max(0.0);
+    let qy = ((dest_y as f64 + 0.5 - center_y).abs() - inner_half_h).max(0.0);
+    qx * qx + qy * qy <= radius * radius
+}
+
+fn inside_circle(dest_x: usize, dest_y: usize, fit: &SourceFit) -> bool {
+    let center_x = f64::from(fit.x) + f64::from(fit.width) / 2.0;
+    let center_y = f64::from(fit.y) + f64::from(fit.height) / 2.0;
+    let radius = f64::from(fit.width.min(fit.height)) / 2.0;
+    if radius <= 0.0 {
+        return false;
+    }
+    let dx = dest_x as f64 + 0.5 - center_x;
+    let dy = dest_y as f64 + 0.5 - center_y;
+    dx * dx + dy * dy <= radius * radius
 }
 
 fn source_pixel_len(source: &RgbaSource<'_>) -> usize {
@@ -4387,8 +4598,10 @@ fn compositor_scene_sources(
                     shape: if matches!(source.kind, SceneSourceKind::Camera) {
                         Some(if camera_circle_mask_applies(&snapshot.layout) {
                             CameraShape::Circle
-                        } else if matches!(camera_mask(&snapshot.layout), SceneMask::Rounded { .. })
-                        {
+                        } else if matches!(
+                            camera_source_mask(&snapshot.layout),
+                            SourceMask::Rounded { .. }
+                        ) {
                             CameraShape::Rounded
                         } else {
                             CameraShape::Rectangle
@@ -4507,7 +4720,24 @@ fn compositor_scene_source_fit(
 }
 
 fn camera_circle_mask_applies(layout: &LayoutSettings) -> bool {
-    matches!(camera_mask(layout), SceneMask::Circle)
+    matches!(layout.layout_preset, LayoutPreset::ScreenCamera)
+        && matches!(layout.camera_shape, CameraShape::Circle)
+}
+
+/// The camera bubble's mask for BOTH software compositors — one derivation,
+/// mirrored by the FFmpeg filter graph (rounded_alpha_mask_filter): circle
+/// inscribes min(w,h); rounded clips corners at radius_pct% of the shorter side.
+fn camera_source_mask(layout: &LayoutSettings) -> SourceMask {
+    if !matches!(layout.layout_preset, LayoutPreset::ScreenCamera) {
+        return SourceMask::None;
+    }
+    match layout.camera_shape {
+        CameraShape::Circle => SourceMask::Circle,
+        CameraShape::Rounded => SourceMask::Rounded {
+            radius_pct: layout.camera_corner_radius_pct.min(50),
+        },
+        CameraShape::Rectangle => SourceMask::None,
+    }
 }
 
 fn full_frame_transform() -> SceneTransform {
@@ -4952,7 +5182,7 @@ mod tests {
                 },
                 contain: false,
                 mirror_x: false,
-                mask: SceneMask::None,
+                mask: SourceMask::None,
             },
         ));
 

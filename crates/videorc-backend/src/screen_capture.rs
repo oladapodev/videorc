@@ -1,12 +1,29 @@
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
+#[cfg(target_os = "macos")]
+use std::sync::mpsc;
 use std::time::Duration;
 
-use crate::protocol::{Device, DeviceKind, DeviceStatus};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use crate::protocol::DeviceKind;
+use crate::protocol::{Device, DeviceStatus};
 
 const SCREEN_CAPTUREKIT_PREFIX: &str = "screen:screencapturekit:";
 const WINDOW_CAPTUREKIT_PREFIX: &str = "window:screencapturekit:";
 const WINDOWS_DXGI_SCREEN_PREFIX: &str = "screen:dxgi:";
 const WINDOWS_GDIGRAB_DESKTOP_ID: &str = "screen:gdigrab:desktop";
+#[allow(dead_code)]
 const SCREEN_CAPTUREKIT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// Single Linux screen source id. The portal cannot enumerate monitors and
+/// windows without showing its own picker (that dialog IS the permission
+/// model), so the app offers one entry and the compositor picker chooses the
+/// concrete source; a persisted restore token keeps that a one-time prompt.
+pub const PORTAL_SCREENCAST_ID: &str = "screen:portal:screencast";
+
+pub fn is_portal_screencast_id(id: &str) -> bool {
+    id == PORTAL_SCREENCAST_ID
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeCaptureSources {
@@ -40,12 +57,28 @@ pub fn list_native_capture_sources() -> NativeCaptureSources {
     macos::list_native_capture_sources()
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(target_os = "linux")]
 pub fn list_native_capture_sources() -> NativeCaptureSources {
-    windows_native::list_native_capture_sources()
+    NativeCaptureSources {
+        devices: vec![Device {
+            id: PORTAL_SCREENCAST_ID.to_string(),
+            name: "Screen Capture".to_string(),
+            kind: DeviceKind::Screen,
+            status: DeviceStatus::Available,
+            detail: Some(
+                "Same model as OBS on Wayland: your desktop's share dialog picks the \
+                 monitor or window (Wayland cannot list them in-app). The choice is \
+                 remembered so you are not asked every time."
+                    .to_string(),
+            ),
+            width: None,
+            height: None,
+        }],
+        warnings: Vec::new(),
+    }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn list_native_capture_sources() -> NativeCaptureSources {
     NativeCaptureSources {
         devices: Vec::new(),
@@ -74,6 +107,7 @@ fn windows_gdigrab_desktop_device() -> Device {
     }
 }
 
+#[allow(dead_code)]
 fn permission_or_unavailable(error: &str) -> DeviceStatus {
     let normalized = error.to_lowercase();
     if normalized.contains("permission")
@@ -87,6 +121,7 @@ fn permission_or_unavailable(error: &str) -> DeviceStatus {
     }
 }
 
+#[allow(dead_code)]
 fn should_include_window_metadata(
     is_on_screen: bool,
     layer: isize,
@@ -107,6 +142,7 @@ fn should_include_window_metadata(
             || app_name.is_some_and(|value| !value.is_empty()))
 }
 
+#[allow(dead_code)]
 pub(crate) fn is_foreign_session_window_app(app_name: Option<&str>) -> bool {
     app_name.is_some_and(|value| value.eq_ignore_ascii_case("loginwindow"))
 }

@@ -34,6 +34,11 @@ const ffmpegPath =
 const timeoutMs = Number(process.env.VIDEORC_SMOKE_TIMEOUT_MS ?? 45000)
 const recordingMs = Number(process.env.VIDEORC_SMOKE_RECORDING_MS ?? 2000)
 const launchAttempts = Number(process.env.VIDEORC_PACKAGED_SMOKE_LAUNCH_ATTEMPTS ?? 2)
+// Intent: allow an unpacked CI artifact to run without a root-owned SUID helper.
+// Benefit: the smoke can validate the app as an ordinary GitHub runner user;
+// installed production launches do not set this opt-in flag.
+const appLaunchArgs =
+  process.env.VIDEORC_PACKAGED_SMOKE_NO_SANDBOX === '1' ? ['--no-sandbox'] : []
 
 if (!existsSync(appExecutable)) {
   throw new Error(`Packaged app executable not found: ${appExecutable}`)
@@ -138,7 +143,7 @@ function launchAndReadConnections() {
       }
     }
 
-    appProcess = spawn(appExecutable, [], {
+    appProcess = spawn(appExecutable, appLaunchArgs, {
       env: smokeAppEnv({
         VIDEORC_USER_DATA_DIR: join(outputDirectory, 'user-data'),
         VIDEORC_SMOKE_OUTPUT_DIR: outputDirectory,

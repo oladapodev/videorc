@@ -1,3 +1,5 @@
+#![cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -5,9 +7,10 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::audio::{
-    AudioProcessingSettings, list_native_microphones, parse_coreaudio_microphone_id,
+    AudioProcessingSettings, list_native_microphones, parse_native_microphone_id,
     sample_native_audio_meter,
 };
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use crate::camera_capture::list_native_cameras;
 use crate::ffmpeg::resolve_ffmpeg_path;
 use crate::process_job::output_owned_tokio;
@@ -55,6 +58,47 @@ pub async fn list_devices(ffmpeg_path: &str) -> DeviceList {
 async fn list_macos_devices(ffmpeg_path: &str) -> DeviceList {
     let mut devices = Vec::new();
     let mut warnings = Vec::new();
+
+    if cfg!(target_os = "linux") {
+        // Linux port: microphones (PipeWire), cameras (V4L2), and screen
+        // capture (portal ScreenCast) are live. The portal offers one screen
+        // entry; the compositor picker chooses the concrete monitor/window.
+        let native_sources = list_native_capture_sources();
+        warnings.extend(native_sources.warnings);
+        devices.extend(native_sources.devices);
+        let native_cameras = list_native_cameras();
+        warnings.extend(native_cameras.warnings);
+        devices.extend(native_cameras.devices);
+        devices.push(system_audio_placeholder());
+        devices.extend(list_native_microphones());
+        return DeviceList { devices, warnings };
+    }
+
+    if !cfg!(target_os = "macos") {
+        devices.extend([
+            Device {
+                id: "screen:unsupported-platform".to_string(),
+                name: "Primary Display".to_string(),
+                kind: DeviceKind::Screen,
+                status: DeviceStatus::Unavailable,
+                detail: Some("This spike only probes macOS devices.".to_string()),
+                width: None,
+                height: None,
+            },
+            Device {
+                id: "window:unsupported-platform".to_string(),
+                name: "Window Capture".to_string(),
+                kind: DeviceKind::Window,
+                status: DeviceStatus::Unavailable,
+                detail: Some("This spike only probes macOS devices.".to_string()),
+                width: None,
+                height: None,
+            },
+            system_audio_placeholder(),
+        ]);
+        warnings.push("Device probing is only implemented for macOS in this spike.".to_string());
+        return DeviceList { devices, warnings };
+    }
 
     let native_capture_sources = list_native_capture_sources();
     let screen_capture_permission_required = native_capture_sources.devices.iter().any(|device| {
@@ -405,14 +449,14 @@ fn normalize_device_name(name: &str) -> String {
 }
 
 pub async fn sample_audio_meter(params: AudioMeterParams) -> AudioMeterResult {
-    if !cfg!(target_os = "macos") {
+    if !cfg!(any(target_os = "macos", target_os = "linux")) {
         return AudioMeterResult {
             status: AudioMeterStatus::Unavailable,
             level: None,
             peak_db: None,
             mean_db: None,
             message: Some(
-                "Audio meter sampling is only implemented for macOS in this spike.".to_string(),
+                "Audio meter sampling is only implemented for macOS and Linux.".to_string(),
             ),
         };
     }
@@ -427,7 +471,7 @@ pub async fn sample_audio_meter(params: AudioMeterParams) -> AudioMeterResult {
         };
     };
 
-    if let Some(device_id) = parse_coreaudio_microphone_id(microphone_id) {
+    if let Some(device_id) = parse_native_microphone_id(microphone_id) {
         return sample_native_audio_meter(
             device_id,
             AudioProcessingSettings {
@@ -556,7 +600,7 @@ pub async fn sample_native_audio_meters(
     let probes = list_native_microphones()
         .into_iter()
         .filter_map(|device| {
-            let device_id = parse_coreaudio_microphone_id(&device.id)?;
+            let device_id = parse_native_microphone_id(&device.id)?;
             let result = if device.status == DeviceStatus::Available {
                 sample_native_audio_meter(device_id, settings)
             } else {

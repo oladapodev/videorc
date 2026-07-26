@@ -43,20 +43,24 @@ const PREVIEW_PRESENT_BUDGET_P99_MS = 150
 export function studioHealth(
   stats: StudioHealthInput,
   active: boolean,
-  platform?: string
+  softwarePreview = false
 ): StudioHealth {
-  // Off macOS there is no Metal GPU compositor and no native preview surface,
-  // so the CPU compositor ('cpu') and image-polling preview ARE the intended
-  // paths — they must read healthy. Only macOS's 'cpu-fallback' (Metal asked
-  // for, not obtained) is a real degradation. The backend already reports
-  // 'cpu' vs 'cpu-fallback' per platform; this guard also protects the
-  // frame-count fast path (which counts both) and the transport check.
-  const nativePreviewExpected = platform === undefined || platform === 'darwin'
-
-  if (
-    stats.compositorBackend === 'cpu-fallback' ||
-    (active && nativePreviewExpected && stats.compositorCpuFallbackFrames > 0)
-  ) {
+  // On a software-preview platform (Linux etc.) there is no Metal path, so the
+  // CPU compositor is the NATIVE compositor — and it is the very same one that
+  // records. Preview and recording cannot diverge, so CPU is not "degraded"
+  // and there is nothing to warn about. (On macOS, CPU means the Metal program
+  // failed and the Metal preview may differ from the CPU recording — the real
+  // degraded state below.)
+  if (!softwarePreview && stats.compositorBackend === 'cpu-fallback') {
+    return {
+      tone: 'error',
+      value: 'Degraded',
+      detail: stats.compositorFallbackReason
+        ? `Preview may not match recording — ${stats.compositorFallbackReason}`
+        : 'Preview may not match recording — compositor is on CPU fallback'
+    }
+  }
+  if (!softwarePreview && active && stats.compositorCpuFallbackFrames > 0) {
     return {
       tone: 'error',
       value: 'Degraded',
@@ -68,10 +72,11 @@ export function studioHealth(
 
   // A fallback transport is the dominant, stable state, so surface it before borderline latency.
   // Otherwise the badge flaps between "Fallback" and "Lagging" while the preview sits on the
-  // polling path and its present latency oscillates around the budget. On platforms without a
-  // native surface, polling is not a fallback — it is the preview path — so it stays quiet.
+  // polling path and its present latency oscillates around the budget. On a software-preview
+  // platform the JPEG stream is the NATIVE preview, not a fallback from a native surface, so
+  // it must not be flagged.
   if (
-    nativePreviewExpected &&
+    !softwarePreview &&
     (stats.previewTransport === 'latest-jpeg-polling' ||
       stats.previewTransport === 'mjpeg-stream' ||
       stats.previewTransport === 'electron-proof-surface')

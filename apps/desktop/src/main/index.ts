@@ -302,6 +302,15 @@ import type {
   ViewerSample
 } from '../shared/backend'
 
+// Headless/software-rendering escape hatch: some Linux sessions (and CI) cannot
+// launch Electron's GPU process, which is otherwise fatal. Set VIDEORC_DISABLE_GPU=1
+// to run with hardware acceleration off. Must be called before app is ready.
+if (process.env.VIDEORC_DISABLE_GPU === '1') {
+  app.disableHardwareAcceleration()
+  app.commandLine.appendSwitch('disable-gpu')
+  app.commandLine.appendSwitch('disable-gpu-compositing')
+}
+
 let mainWindow: BrowserWindow | null = null
 let nativePreviewSurfaceWindow: BrowserWindow | null = null
 let notesWindow: BrowserWindow | null = null
@@ -9505,6 +9514,15 @@ async function stopBackend(): Promise<void> {
 }
 
 async function openSystemPermissions(pane: SystemPermissionPane = 'privacy'): Promise<void> {
+  if (process.platform !== 'darwin') {
+    // No macOS-style per-app permission panes off macOS. On Linux, camera and
+    // microphone need only device-group access (the device list surfaces the
+    // "add your user to the video/audio group" guidance), and screen capture
+    // is granted by the desktop's portal picker when recording starts — there
+    // is nothing to open ahead of time.
+    logBackend('info', `System permission shortcut is not applicable on ${process.platform}.`)
+    return
+  }
   assertPermissionShortcutSupported(process.platform)
 
   const reason = `Restarting capture backend after ${pane} permission became available.`
@@ -9524,6 +9542,12 @@ async function openSystemPermissions(pane: SystemPermissionPane = 'privacy'): Pr
 // lives in media-access.ts (FX1: an already-granted pane must NOT restart the
 // backend — that restart raced the renderer's follow-up meter sample).
 async function requestMediaAccessNative(pane: 'camera' | 'microphone'): Promise<MediaAccessResult> {
+  if (process.platform !== 'darwin') {
+    // Off macOS there is no in-app media-access prompt: the device opens when
+    // the user selects it. A real lack of access (not in the video/audio
+    // group) surfaces on the device itself, not through an OS grant dialog.
+    return { granted: true, restarted: false }
+  }
   assertPermissionShortcutSupported(process.platform)
 
   return requestMediaAccessWithRestart(

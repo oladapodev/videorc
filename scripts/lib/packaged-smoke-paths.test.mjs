@@ -38,8 +38,22 @@ describe('packaged smoke paths', () => {
     )
   })
 
+  it('resolves the default Linux packaged executable and bundled FFmpeg', () => {
+    const executable = defaultPackagedAppExecutable({ repoRoot: '/repo', platform: 'linux' })
+
+    assert.match(
+      posixPath(executable),
+      /\/repo\/apps\/desktop\/release\/linux-unpacked\/videorc$/
+    )
+    assert.match(
+      posixPath(bundledFfmpegPathForPackagedApp({ appExecutable: executable, platform: 'linux' })),
+      /\/repo\/apps\/desktop\/release\/linux-unpacked\/resources\/ffmpeg\/bin\/ffmpeg$/
+    )
+    assert.doesNotThrow(() => assertPackagedSmokePlatform('linux'))
+  })
+
   it('rejects unsupported packaged smoke platforms', () => {
-    assert.throws(() => assertPackagedSmokePlatform('linux'), /supports macOS and Windows/)
-    assert.throws(() => defaultPackagedAppExecutable({ repoRoot: '/repo', platform: 'linux' }), /does not support linux/)
+    assert.throws(() => assertPackagedSmokePlatform('freebsd'), /supports macOS, Windows, and Linux/)
+    assert.throws(() => defaultPackagedAppExecutable({ repoRoot: '/repo', platform: 'freebsd' }), /does not support freebsd/)
   })
 })

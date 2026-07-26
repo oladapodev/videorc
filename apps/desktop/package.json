@@ -4,7 +4,11 @@
   "private": true,
   "main": "./out/main/index.js",
   "description": "Videorc desktop app.",
-  "author": "TheOrcDev",
+  "homepage": "https://github.com/oladapodev/videorc",
+  "author": {
+    "name": "TheOrcDev",
+    "email": "TheOrcDev@users.noreply.github.com"
+  },
   "license": "AGPL-3.0-only",
   "scripts": {
     "dev": "pnpm --dir ../.. build:native-preview-addon && electron-vite dev",

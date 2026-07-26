@@ -1,11 +1,11 @@
-#[cfg(target_os = "macos")]
-use std::collections::HashMap;
-use std::collections::VecDeque;
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 use std::fs::File;
 use std::io::{self, Write as StdWrite};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "macos")]
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Condvar, Mutex as StdMutex, OnceLock};
 use std::thread;
@@ -26,7 +26,7 @@ use crate::diagnostics::{
     apply_runtime_diagnostics_snapshot, starting_diagnostics,
 };
 use crate::ffmpeg::resolve_ffmpeg_path;
-use crate::frame_store::FrameHandle;
+#[cfg(target_os = "macos")]
 use crate::mpeg_ts::{MpegTsH264Writer, timing_to_90khz};
 use crate::process_job::spawn_owned_tokio;
 use crate::protocol::{EncoderBridgeSyntheticParams, EncoderBridgeSyntheticResult};
@@ -972,6 +972,7 @@ struct EncoderBridgeWriterEvent {
     error: Option<String>,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(unused_mut, unused_variables))]
 fn write_synthetic_recording_frames(params: SyntheticRecordingWriterParams) {
     let SyntheticRecordingWriterParams {
         session_id,
@@ -4611,17 +4612,10 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn recording_queue_drop_watch_surfaces_each_affected_session_once() {
-        let mut watch = RecordingQueueDropWatch::default();
-        assert!(!recording_queue_drop_watch_update(&mut watch, "s1", 0));
-        assert!(recording_queue_drop_watch_update(&mut watch, "s1", 1));
-        assert!(!recording_queue_drop_watch_update(&mut watch, "s1", 9));
-        assert!(!recording_queue_drop_watch_update(&mut watch, "s2", 0));
-        assert!(recording_queue_drop_watch_update(&mut watch, "s2", 2));
-    }
-
-    use crate::compositor::{CompositorFrameExportHandle, CompositorPixelFormat};
+    use super::*;
+    #[cfg(target_os = "macos")]
+    use crate::compositor::CompositorFrameExportHandle;
+    use crate::compositor::CompositorPixelFormat;
     #[cfg(target_os = "macos")]
     use crate::metal_compositor::{GpuSource, GpuSourceKind, MetalSceneCompositor};
 

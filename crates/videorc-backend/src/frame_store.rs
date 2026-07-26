@@ -1,4 +1,6 @@
-use std::sync::{Arc, Mutex as StdMutex, Weak};
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
+use std::sync::Arc;
 use std::time::Instant;
 
 #[cfg(target_os = "macos")]
