@@ -82,6 +82,11 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
 
+      - name: Install Linux capture development libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes pkg-config libpipewire-0.3-dev libspa-0.2-dev libv4l-dev libclang-dev
+
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
         with:
@@ -143,6 +148,11 @@ jobs:
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux capture development libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes pkg-config libpipewire-0.3-dev libspa-0.2-dev libv4l-dev libclang-dev
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
@@ -214,6 +224,11 @@ jobs:
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux capture development libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes pkg-config libpipewire-0.3-dev libspa-0.2-dev libv4l-dev libclang-dev
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4

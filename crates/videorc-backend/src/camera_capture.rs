@@ -46,19 +46,23 @@ pub fn list_native_cameras() -> NativeCameraDevices {
     macos::list_native_cameras()
 }
 
-    #[cfg(target_os = "linux")]
-    {
-        linux::list_native_cameras()
-    }
+#[cfg(target_os = "windows")]
+pub fn list_native_cameras() -> NativeCameraDevices {
+    windows_native::list_native_cameras()
+}
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        NativeCameraDevices {
-            devices: Vec::new(),
-            warnings: vec![
-                "Native camera discovery is only available on macOS and Linux.".to_string(),
-            ],
-        }
+#[cfg(target_os = "linux")]
+pub fn list_native_cameras() -> NativeCameraDevices {
+    linux::list_native_cameras()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+pub fn list_native_cameras() -> NativeCameraDevices {
+    NativeCameraDevices {
+        devices: Vec::new(),
+        warnings: vec![
+            "Native camera discovery is only available on macOS, Windows, and Linux.".to_string(),
+        ],
     }
 }
 

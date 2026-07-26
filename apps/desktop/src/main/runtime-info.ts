@@ -21,8 +21,6 @@ export const WINDOWS_PERMISSION_URLS: Partial<Record<SystemPermissionPane, strin
 export interface RuntimeInfoInput {
   /** `app.getVersion()` — the running app version. */
   appVersion: string
-  /** Defaults to `process.platform`; injectable for tests. */
-  platform?: NodeJS.Platform
   execPath: string
   captureExecPath?: string
   platform?: NodeJS.Platform
@@ -82,7 +80,6 @@ export function assertPermissionShortcutSupported(platform: NodeJS.Platform): vo
 
 export function buildRuntimeInfo({
   appVersion,
-  platform,
   execPath,
   captureExecPath,
   platform = process.platform,
@@ -98,7 +95,11 @@ export function buildRuntimeInfo({
 
   return {
     version: appVersion,
-    platform: platform ?? process.platform,
+    platform,
+    arch,
+    osRelease,
+    gpuDevices: normalizeRuntimeGpuDevices(gpuInfo),
+    hardwareAccelerationDisabled,
     isPackaged,
     permissionTargetName: isPackaged ? 'Videorc' : 'Electron',
     permissionTargetPath: targetPath,
